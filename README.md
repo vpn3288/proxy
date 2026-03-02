@@ -1,2 +1,2 @@
-# proxy
-WireGuard链式代理----中转机和落地机。
+# 中转
+bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/zhongzhuan.sh)

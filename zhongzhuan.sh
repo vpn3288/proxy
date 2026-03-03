@@ -3,7 +3,7 @@
 ################################################################################
 #                                                                              #
 #               CN2GIA中转机 WireGuard + Mack-a 一键部署脚本                   #
-#                           v1.1.1                                             #
+#                           v1.1.2                                             #
 #                                                                              #
 #  修复：                                                                       #
 #    - Ubuntu 24.04 无 openresolv 包问题                                        #
@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║        CN2GIA中转机 WireGuard + Mack-a 一键部署工具             ║"
-    echo "║                    v1.1.1                                      ║"
+    echo "║                    v1.1.2                                      ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -243,7 +243,7 @@ print_info "更新软件包列表..."
 apt-get update -qq
 
 # ---- 基础包 ----
-BASE_PKGS="wireguard wireguard-tools curl wget net-tools"
+BASE_PKGS="wireguard wireguard-tools curl wget net-tools iptables"
 
 # ---- 检测 openresolv 是否真正可安装（apt-cache policy 有候选版本才算）----
 # apt-cache show 在包被虚拟引用时也会返回0，需用 policy 判断实际候选
@@ -268,13 +268,6 @@ if ! modprobe wireguard 2>/dev/null; then
 else
     print_success "WireGuard 内核模块可用"
 fi
-
-# ---- 安装 ufw（移除 iptables-persistent 冲突前先备份规则）----
-if dpkg -l | grep -q iptables-persistent 2>/dev/null; then
-    print_warn "检测到 iptables-persistent，将移除以避免与 ufw 冲突（规则已备份到 /root/iptables-backup.rules）"
-    iptables-save > /root/iptables-backup.rules 2>/dev/null || true
-fi
-apt-get install -y ufw
 
 print_success "所有依赖已安装"
 
@@ -494,29 +487,61 @@ pause_input
 print_section "步骤 7/8: 配置防火墙"
 # ============================================================================
 
-print_info "正在配置UFW防火墙..."
+print_info "下载并运行 iptables 防火墙脚本（中转机模式）..."
 
-# 确保 ufw 不会锁掉当前 SSH 连接
-ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1 || true
-ufw allow "${WG_PORT}/udp" comment 'WireGuard' > /dev/null 2>&1 || true
-ufw allow "${MACKA_PORT}/tcp" comment 'Mack-a' > /dev/null 2>&1 || true
+FW_SCRIPT="/opt/relay-wg/port.sh"
 
-# 设置默认策略
-ufw default deny incoming > /dev/null 2>&1 || true
-ufw default allow outgoing > /dev/null 2>&1 || true
-
-# 检测当前 SSH 端口（避免非22端口被锁）
-CURRENT_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
-if [[ -n "$CURRENT_SSH_PORT" && "$CURRENT_SSH_PORT" != "22" ]]; then
-    ufw allow "${CURRENT_SSH_PORT}/tcp" comment 'SSH (custom port)' > /dev/null 2>&1 || true
-    print_warn "检测到非标准SSH端口 $CURRENT_SSH_PORT，已添加放行规则"
+# 优先从 GitHub 下载最新版，失败则使用内嵌备份
+if curl -sSL --max-time 15 \
+    "https://raw.githubusercontent.com/vpn3288/iptables/refs/heads/main/port.sh" \
+    -o "$FW_SCRIPT" 2>/dev/null; then
+    print_success "防火墙脚本已下载"
+else
+    print_warn "GitHub 下载失败，使用内嵌版本..."
+    # 内嵌备用：直接复制当前已知可用版本
+    cp /dev/stdin "$FW_SCRIPT" << 'FWEOF'
+#!/bin/bash
+# 内嵌极简版，仅在无法下载时使用
+set -uo pipefail
+[[ $(id -u) -eq 0 ]] || { echo "需要 root"; exit 1; }
+WG_PORT="${1:-51820}"
+MACKA_PORT="${2:-8080}"
+WG_SUBNET="${3:-10.0.0.0/24}"
+SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | grep -oE '[0-9]+' | head -1 || echo 22)
+WAN=$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}' || echo eth0)
+iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
+iptables -F; iptables -X; iptables -t nat -F; iptables -t nat -X
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
+iptables -A INPUT -p udp --dport "$WG_PORT" -j ACCEPT
+iptables -A INPUT -p tcp --dport "$MACKA_PORT" -j ACCEPT
+iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -t nat -A POSTROUTING -s "$WG_SUBNET" -o "$WAN" -j MASQUERADE
+iptables -A INPUT -j DROP
+mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4
+echo "✓ 防火墙配置完成（内嵌极简版）"
+FWEOF
 fi
 
-echo "y" | ufw enable > /dev/null 2>&1 || true
-ufw reload > /dev/null 2>&1 || true
+chmod +x "$FW_SCRIPT"
+
+# 以中转机模式调用，自动传入本次部署的端口参数，无需交互确认
+bash "$FW_SCRIPT" \
+    --relay \
+    --wg-port   "$WG_PORT" \
+    --macka-port "$MACKA_PORT" \
+    --wg-subnet  "10.0.0.0/24" \
+    --wg-iface   "wg0" \
+    << 'CONFIRM'
+y
+CONFIRM
 
 print_success "防火墙配置完成"
-ufw status numbered
+print_info "后续管理命令："
+print_info "  查看状态: bash $FW_SCRIPT --status"
+print_info "  重置规则: bash $FW_SCRIPT --reset"
 
 pause_input
 
@@ -552,7 +577,12 @@ echo ""
 echo -e "${YELLOW}【常用命令】${NC}"
 echo -e "  查看WireGuard状态:  ${CYAN}wg show${NC}"
 echo -e "  重启WireGuard:      ${CYAN}systemctl restart wg-quick@wg0${NC}"
-echo -e "  查看日志:           ${CYAN}journalctl -u wg-quick@wg0 -f${NC}"
+echo -e "  查看WG日志:         ${CYAN}journalctl -u wg-quick@wg0 -f${NC}"
+echo -e "  查看防火墙状态:     ${CYAN}bash /opt/relay-wg/port.sh --status${NC}"
+echo -e "  添加端口跳跃:       ${CYAN}bash /opt/relay-wg/port.sh --add-hop${NC}"
+echo -e "  重置防火墙:         ${CYAN}bash /opt/relay-wg/port.sh --reset${NC}"
+echo -e "  查看iptables规则:   ${CYAN}iptables -L -n -v${NC}"
+echo -e "  查看NAT规则:        ${CYAN}iptables -t nat -L -n -v${NC}"
 echo -e "  查看部署摘要:       ${CYAN}cat $CONFIG_DIR/summary.txt${NC}"
 echo ""
 echo -e "${GREEN}所有配置文件已保存，请妥善保管 ${CONFIG_DIR}/summary.txt${NC}"

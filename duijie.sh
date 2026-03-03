@@ -38,7 +38,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║           落地机代理节点 ↔ 中转机 一键对接工具                  ║"
-    echo "║                       v1.00                                   ║"
+    echo "║                       v1.01                                   ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -78,19 +78,49 @@ print_section "步骤 1/5: 读取本机信息"
 # ============================================================================
 
 # ---- 读取 luodi.sh 保存的摘要 ----
-SUMMARY_FILE="/opt/relay-wg/config/peer-summary.txt"
-if [[ ! -f "$SUMMARY_FILE" ]]; then
-    print_error "未找到落地机摘要文件: $SUMMARY_FILE"
+# 兼容新版(peer-summary.txt)和旧版(summary.txt)
+SUMMARY_FILE=""
+for f in \
+    "/opt/relay-wg/config/peer-summary.txt" \
+    "/opt/relay-wg/config/summary.txt"; do
+    if [[ -f "$f" ]]; then
+        SUMMARY_FILE="$f"
+        break
+    fi
+done
+
+if [[ -z "$SUMMARY_FILE" ]]; then
+    print_error "未找到落地机摘要文件"
+    print_error "查找路径："
+    print_error "  /opt/relay-wg/config/peer-summary.txt"
+    print_error "  /opt/relay-wg/config/summary.txt"
     print_error "请先运行 luodi.sh 完成 WireGuard 部署"
     exit 1
 fi
 
-# 从摘要文件提取关键信息
-RELAY_IP=$(grep '中转机公网IP' "$SUMMARY_FILE" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-WG_LOCAL_IP=$(grep 'WireGuard地址\|WireGuard IP' "$SUMMARY_FILE" | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-LANDING_IP=$(curl -s --max-time 5 https://api.ip.sb/ip 2>/dev/null \
-    || curl -s --max-time 5 https://ifconfig.me 2>/dev/null \
-    || echo "")
+print_info "读取摘要: $SUMMARY_FILE"
+
+# 兼容两种格式提取中转机IP
+RELAY_IP=$(grep -E '中转机公网IP|公网 IP.*:' "$SUMMARY_FILE" \
+    | grep -v '本落地机\|本机\|落地机' \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+
+# 兼容两种格式提取本机WG IP
+WG_LOCAL_IP=$(grep -E 'WireGuard地址|WireGuard IP' "$SUMMARY_FILE" \
+    | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+# 兼容两种格式提取落地机公网IP
+LANDING_IP=$(grep -E '公网 IP|本机公网IP|落地机.*IP' "$SUMMARY_FILE" \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+    | grep -v "^10\." | head -1)
+
+# 如果摘要里没有落地机公网IP，实时获取
+if [[ -z "$LANDING_IP" ]]; then
+    print_info "正在获取本机公网IP..."
+    LANDING_IP=$(curl -s --max-time 5 https://api.ip.sb/ip 2>/dev/null \
+        || curl -s --max-time 5 https://ifconfig.me 2>/dev/null \
+        || echo "")
+fi
 
 if [[ -z "$RELAY_IP" ]]; then
     print_error "无法从摘要文件读取中转机IP，请检查 $SUMMARY_FILE"

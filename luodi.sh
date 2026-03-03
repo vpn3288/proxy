@@ -3,7 +3,7 @@
 ################################################################################
 #                                                                              #
 #                 落地机 WireGuard + Mack-a 一键部署脚本                        #
-#                           v1.04                                              #
+#                           v1.01                                              #
 #                                                                              #
 #  修复/改进：                                                                   #
 #    - 所有输入错误时提示并要求重新输入，不再直接退出                               #
@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║           落地机 WireGuard + Mack-a 一键部署工具               ║"
-    echo "║                       v1.04                                   ║"
+    echo "║                       v1.05                                   ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -322,23 +322,21 @@ chmod 700 /etc/wireguard
 
 print_info "正在生成WireGuard配置文件..."
 
-# 检测 DNS 解析支持情况，避免 resolvconf 不存在导致 wg-quick 启动失败
+# 检测 DNS 是否真正可用：
+# resolvconf 存在 但底层依赖 systemd-resolved，需两者都正常才能用
 WG_DNS_LINE=""
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     WG_DNS_LINE="DNS = 8.8.8.8, 1.1.1.1"
-    print_info "检测到 systemd-resolved，启用 DNS 配置"
-elif command -v resolvconf &>/dev/null; then
-    WG_DNS_LINE="DNS = 8.8.8.8, 1.1.1.1"
-    print_info "检测到 resolvconf，启用 DNS 配置"
+    print_info "检测到 systemd-resolved 运行中，启用 DNS 配置"
 else
-    print_warn "未检测到 DNS 解析器（resolvconf/systemd-resolved），跳过 DNS 配置以防启动失败"
+    print_warn "systemd-resolved 未运行，跳过 DNS 配置（避免 wg-quick 启动失败）"
 fi
 
 cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
 Address = $WG_ADDRESS
 PrivateKey = $WG_PRIVKEY
-${WG_DNS_LINE:+DNS = 8.8.8.8, 1.1.1.1}
+${WG_DNS_LINE}
 
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
@@ -349,6 +347,9 @@ Endpoint = $RELAY_IP:$WG_PORT
 AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 EOF
+
+# 清理配置文件中可能存在的空 DNS 行
+sed -i '/^[[:space:]]*$/d' /etc/wireguard/wg0.conf
 
 chmod 600 /etc/wireguard/wg0.conf
 print_success "WireGuard配置已生成"

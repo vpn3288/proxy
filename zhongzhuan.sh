@@ -242,17 +242,15 @@ print_section "步骤 3/8: 安装依赖"
 print_info "更新软件包列表..."
 apt-get update -qq
 
-# ---- 基础包（跳过 openresolv，Ubuntu 24.04 不需要）----
+# ---- 基础包 ----
 BASE_PKGS="wireguard wireguard-tools curl wget net-tools"
 
-# ---- 根据系统版本决定是否安装 openresolv ----
-# Ubuntu 18.04/20.04/Debian 10/11 有 openresolv；Ubuntu 22.04+ 用 systemd-resolved
-NEED_OPENRESOLV=false
-if apt-cache show openresolv &>/dev/null 2>&1; then
-    # 包存在才安装
-    NEED_OPENRESOLV=true
+# ---- 检测 openresolv 是否真正可安装（apt-cache policy 有候选版本才算）----
+# apt-cache show 在包被虚拟引用时也会返回0，需用 policy 判断实际候选
+OPENRESOLV_CANDIDATE=$(apt-cache policy openresolv 2>/dev/null | grep 'Candidate:' | awk '{print $2}')
+if [[ -n "$OPENRESOLV_CANDIDATE" && "$OPENRESOLV_CANDIDATE" != "(none)" ]]; then
     BASE_PKGS="$BASE_PKGS openresolv"
-    print_info "检测到 openresolv 可用，将一并安装"
+    print_info "检测到 openresolv 可安装（$OPENRESOLV_CANDIDATE），将一并安装"
 else
     print_info "系统无 openresolv（Ubuntu 22.04+ 正常），使用 systemd-resolved"
 fi

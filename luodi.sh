@@ -3,7 +3,7 @@
 ################################################################################
 #                                                                              #
 #                 落地机 WireGuard + Mack-a 一键部署脚本                        #
-#                           v1.01                                              #
+#                           v1.04                                              #
 #                                                                              #
 #  修复/改进：                                                                   #
 #    - 所有输入错误时提示并要求重新输入，不再直接退出                               #
@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║           落地机 WireGuard + Mack-a 一键部署工具               ║"
-    echo "║                       v1.02                                   ║"
+    echo "║                       v1.04                                   ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -201,14 +201,27 @@ print_success "中转机UUID: $RELAY_UUID"
 echo ""
 
 # ---- 落地机 WG 私钥 ----
-print_input "此落地机的WireGuard私钥（来自中转机生成的 xxx-wg.conf 文件 [Interface] PrivateKey）"
+echo -e "${YELLOW}[!]${NC} 私钥 ≠ 公钥！私钥在 xxx-wg.conf 的 ${CYAN}[Interface]${NC} 段 ${CYAN}PrivateKey${NC} 字段"
+echo -e "    公钥在 ${CYAN}[Peer]${NC} 段，千万不要填反。在中转机运行以下命令查看："
+echo -e "    ${CYAN}cat /opt/relay-wg/config/peer-configs/此落地机名称-wg.conf${NC}"
 read_input WG_PRIVKEY "WireGuard私钥" validate_wg_key "私钥应为44字符的Base64字符串（以=结尾）"
 print_success "WireGuard私钥已设置"
 echo ""
 
 # ---- 中转机 WG 公钥 ----
-print_input "中转机的WireGuard公钥（来自中转机生成的 xxx-wg.conf 文件 [Peer] PublicKey）"
-read_input RELAY_PUBKEY "中转机WireGuard公钥" validate_wg_key "公钥应为44字符的Base64字符串（以=结尾）"
+echo -e "${YELLOW}[!]${NC} 中转机公钥在 xxx-wg.conf 的 ${CYAN}[Peer]${NC} 段 ${CYAN}PublicKey${NC} 字段"
+echo -e "    或在中转机运行 ${CYAN}relay-info${NC} 查看「中转机WireGuard公钥」"
+while true; do
+    read_input RELAY_PUBKEY "中转机WireGuard公钥" validate_wg_key "公钥应为44字符的Base64字符串（以=结尾）"
+    if [[ "$WG_PRIVKEY" == "$RELAY_PUBKEY" ]]; then
+        print_error "填写的公钥与私钥相同！你可能把公钥填到了私钥字段"
+        print_warn "请回头检查：[Interface] PrivateKey 是私钥，[Peer] PublicKey 是中转机公钥"
+        echo -e "    在中转机运行: ${CYAN}cat /opt/relay-wg/config/peer-configs/落地机名称-wg.conf${NC}"
+        print_warn "请重新输入中转机公钥 ↑"
+    else
+        break
+    fi
+done
 print_success "中转机公钥已设置"
 echo ""
 
@@ -309,11 +322,23 @@ chmod 700 /etc/wireguard
 
 print_info "正在生成WireGuard配置文件..."
 
+# 检测 DNS 解析支持情况，避免 resolvconf 不存在导致 wg-quick 启动失败
+WG_DNS_LINE=""
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    WG_DNS_LINE="DNS = 8.8.8.8, 1.1.1.1"
+    print_info "检测到 systemd-resolved，启用 DNS 配置"
+elif command -v resolvconf &>/dev/null; then
+    WG_DNS_LINE="DNS = 8.8.8.8, 1.1.1.1"
+    print_info "检测到 resolvconf，启用 DNS 配置"
+else
+    print_warn "未检测到 DNS 解析器（resolvconf/systemd-resolved），跳过 DNS 配置以防启动失败"
+fi
+
 cat > /etc/wireguard/wg0.conf <<EOF
 [Interface]
 Address = $WG_ADDRESS
 PrivateKey = $WG_PRIVKEY
-DNS = 8.8.8.8, 1.1.1.1
+${WG_DNS_LINE:+DNS = 8.8.8.8, 1.1.1.1}
 
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE

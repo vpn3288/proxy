@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║           落地机 WireGuard + Mack-a 一键部署工具               ║"
-    echo "║                       v1.01                                   ║"
+    echo "║                       v1.02                                   ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -233,7 +233,9 @@ print_success "虚拟IP: $WG_ADDRESS"
 echo ""
 
 # ---- 落地机 UUID ----
-print_input "此落地机的UUID（来自中转机生成的 xxx-macka.conf 文件 uuid 字段）"
+echo -e "${YELLOW}[!]${NC} 落地机UUID 来自中转机屏幕输出的 【落地机 N: 名称】 区块中的「落地机UUID」一行"
+echo -e "    也可以在中转机运行: ${CYAN}relay-info${NC}  或  ${CYAN}cat /opt/relay-wg/config/summary.txt${NC}"
+print_input "此落地机的UUID（每台落地机不同，不要填中转机UUID）"
 read_input PEER_UUID "落地机UUID" validate_uuid "UUID格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 print_success "落地机UUID: $PEER_UUID"
 echo ""

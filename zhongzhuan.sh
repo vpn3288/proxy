@@ -3,7 +3,7 @@
 ################################################################################
 #                                                                              #
 #               CN2GIA中转机 WireGuard + Mack-a 一键部署脚本                   #
-#                           v1.1.2                                             #
+#                           v1.1.0                                             #
 #                                                                              #
 #  修复：                                                                       #
 #    - Ubuntu 24.04 无 openresolv 包问题                                        #
@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║        CN2GIA中转机 WireGuard + Mack-a 一键部署工具             ║"
-    echo "║                    v1.1.2                                      ║"
+    echo "║                    v1.12                                       ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -552,38 +552,61 @@ print_section "步骤 8/8: 完成总结"
 print_success "部署完成！"
 echo ""
 
-echo -e "${YELLOW}【中转机信息】${NC}"
-echo -e "  公网IP:        ${GREEN}$RELAY_IP${NC}"
-echo -e "  WireGuard端口: ${GREEN}$WG_PORT/UDP${NC}"
-echo -e "  WireGuard公钥: ${GREEN}$RELAY_PUB${NC}"
-echo -e "  Mack-a端口:    ${GREEN}$MACKA_PORT/TCP${NC}"
+# ---- 安装 relay-info 快捷命令 ----
+cat > /usr/local/bin/relay-info << CMEOF
+#!/bin/bash
+CYAN='\033[0;36m' YELLOW='\033[1;33m' GREEN='\033[0;32m' NC='\033[0m'
+cat /opt/relay-wg/config/summary.txt 2>/dev/null || echo "摘要文件不存在: /opt/relay-wg/config/summary.txt"
+echo ""
+echo -e "\${CYAN}━━━━━━━━━━━━━━━━ 实时状态 ━━━━━━━━━━━━━━━━\${NC}"
+echo -e "\${GREEN}▸ WireGuard 运行状态:\${NC}"
+wg show 2>/dev/null || echo "  (未运行)"
+CMEOF
+chmod +x /usr/local/bin/relay-info
+print_success "已安装 relay-info 快捷命令"
 echo ""
 
-echo -e "${YELLOW}【认证信息】${NC}"
-echo -e "  UUID:   ${GREEN}$RELAY_UUID${NC}"
-echo -e "  Token:  ${GREEN}$MACKA_TOKEN${NC}"
+# ════════════════════════════════════════════════════════════════
+# 展示：中转机信息 + 每台落地机的完整部署信息
+# ════════════════════════════════════════════════════════════════
+echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║         ★ 部署完成！以下是落地机部署所需的完整信息 ★          ║${NC}"
+echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-echo -e "${YELLOW}【落地机配置文件】${NC}"
-echo -e "  目录: ${GREEN}$CONFIG_DIR/peer-configs/${NC}"
+echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${YELLOW}│  【中转机公共信息】 — 每台落地机都需要填写这些              │${NC}"
+echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
+echo -e "  中转机公网IP       → ${GREEN}$RELAY_IP${NC}"
+echo -e "  WireGuard端口      → ${GREEN}$WG_PORT/UDP${NC}"
+echo -e "  Mack-a端口         → ${GREEN}$MACKA_PORT/TCP${NC}"
+echo -e "  Mack-a Token       → ${GREEN}$MACKA_TOKEN${NC}  ← 所有落地机共用"
+echo -e "  中转机UUID         → ${GREEN}$RELAY_UUID${NC}  ← 所有落地机共用"
+echo -e "  中转机WireGuard公钥→ ${GREEN}$RELAY_PUB${NC}"
 echo ""
+
 for (( i=1; i<=PEER_COUNT; i++ )); do
-    echo -e "  ${CYAN}${PEER_NAMES[$i]}${NC} (10.0.0.${PEER_IPS[$i]})"
-    echo -e "    ├─ ${PEER_NAMES[$i]}-wg.conf"
-    echo -e "    └─ ${PEER_NAMES[$i]}-macka.conf"
+    echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${YELLOW}│  【落地机 $i: ${PEER_NAMES[$i]}】 — 此台机器专属，不可混用          │${NC}"
+    echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "  虚拟IP (WG Address) → ${GREEN}10.0.0.${PEER_IPS[$i]}/32${NC}"
+    echo -e "  WireGuard私钥       → ${GREEN}${PEER_PRIVKEYS[$i]}${NC}  ← 填到落地机脚本[私钥]"
+    echo -e "  落地机UUID          → ${GREEN}${PEER_UUIDS[$i]}${NC}  ← 填到落地机脚本[落地机UUID]"
+    echo -e "  配置文件            → ${CYAN}$CONFIG_DIR/peer-configs/${PEER_NAMES[$i]}-wg.conf${NC}"
+    echo -e "                        ${CYAN}$CONFIG_DIR/peer-configs/${PEER_NAMES[$i]}-macka.conf${NC}"
+    echo ""
 done
-echo ""
 
-echo -e "${YELLOW}【常用命令】${NC}"
+echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${YELLOW}│  【中转机常用命令】                                         │${NC}"
+echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
+echo -e "  查看所有信息:       ${CYAN}relay-info${NC}"
 echo -e "  查看WireGuard状态:  ${CYAN}wg show${NC}"
 echo -e "  重启WireGuard:      ${CYAN}systemctl restart wg-quick@wg0${NC}"
 echo -e "  查看WG日志:         ${CYAN}journalctl -u wg-quick@wg0 -f${NC}"
 echo -e "  查看防火墙状态:     ${CYAN}bash /opt/relay-wg/port.sh --status${NC}"
-echo -e "  添加端口跳跃:       ${CYAN}bash /opt/relay-wg/port.sh --add-hop${NC}"
-echo -e "  重置防火墙:         ${CYAN}bash /opt/relay-wg/port.sh --reset${NC}"
-echo -e "  查看iptables规则:   ${CYAN}iptables -L -n -v${NC}"
 echo -e "  查看NAT规则:        ${CYAN}iptables -t nat -L -n -v${NC}"
-echo -e "  查看部署摘要:       ${CYAN}cat $CONFIG_DIR/summary.txt${NC}"
 echo ""
-echo -e "${GREEN}所有配置文件已保存，请妥善保管 ${CONFIG_DIR}/summary.txt${NC}"
+echo -e "${GREEN}随时运行 ${CYAN}relay-info${GREEN} 可重新查看以上所有信息${NC}"
+echo -e "${GREEN}完整摘要: ${CYAN}cat $CONFIG_DIR/summary.txt${NC}"
 echo ""

@@ -226,8 +226,13 @@ _setup_keyfile() {
             ZZ_KEY=$(eval echo "$ZZ_KEY")
         fi
     else
-        read -rp "密钥文件路径 [如 /root/oracle.pem]: " ZZ_KEY
-        ZZ_KEY=$(eval echo "$ZZ_KEY")
+        while true; do
+            read -rp "密钥文件路径 [如 /root/oracle.pem]: " ZZ_KEY
+            ZZ_KEY=$(eval echo "$ZZ_KEY")
+            [[ -z "$ZZ_KEY" ]] && { warn "路径不能为空，请重新输入"; continue; }
+            [[ -f "$ZZ_KEY" ]] && break
+            warn "文件不存在: $ZZ_KEY，请重新输入"
+        done
     fi
 
     [[ ! -f "$ZZ_KEY" ]] && error "文件不存在: $ZZ_KEY"
@@ -421,10 +426,35 @@ INBOUND_FILE="${v_zz_conf_dir}/relay_inbound_${v_node_tag}.json"
 OUTBOUND_FILE="${v_zz_conf_dir}/relay_outbound_${v_node_tag}.json"
 ROUTING_FILE="${v_zz_conf_dir}/relay_routing_${v_node_tag}.json"
 NODES_FILE="${v_nodes_file}"
-XRAY_BIN=\$(find /usr/local/bin /usr/bin /usr/local/share/xray /opt/xray \
-    -maxdepth 2 -name 'xray' -type f 2>/dev/null | head -1)
+# 方法1: 常见固定路径
+for _p in /usr/local/bin/xray /usr/bin/xray /usr/local/share/xray/xray /opt/xray/xray; do
+    [[ -x "\$_p" ]] && { XRAY_BIN="\$_p"; break; }
+done
+# 方法2: PATH 查找
 [[ -z "\$XRAY_BIN" ]] && XRAY_BIN=\$(command -v xray 2>/dev/null || echo "")
-[[ -z "\$XRAY_BIN" ]] && { echo "[ERROR] 中转机未找到 Xray 二进制"; exit 1; }
+# 方法3: 从 systemd 服务文件提取实际路径
+if [[ -z "\$XRAY_BIN" ]]; then
+    _svc_bin=\$(systemctl show xray --property=ExecStart 2>/dev/null \
+        | grep -oP 'path=\K[^;]+' | head -1 | tr -d '[:space:]')
+    [[ -n "\$_svc_bin" && -x "\$_svc_bin" ]] && XRAY_BIN="\$_svc_bin"
+fi
+# 方法4: 从运行中的进程提取
+if [[ -z "\$XRAY_BIN" ]]; then
+    _proc_bin=\$(ps -eo cmd --no-headers 2>/dev/null \
+        | grep -v grep | grep -i 'xray' | awk '{print \$1}' | head -1)
+    [[ -n "\$_proc_bin" && -x "\$_proc_bin" ]] && XRAY_BIN="\$_proc_bin"
+fi
+# 方法5: 全盘搜索（最慢，兜底）
+if [[ -z "\$XRAY_BIN" ]]; then
+    XRAY_BIN=\$(find /usr /opt /root -maxdepth 5 -name 'xray' -type f \
+        -perm /111 2>/dev/null | head -1)
+fi
+if [[ -z "\$XRAY_BIN" ]]; then
+    echo "[ERROR] 中转机未找到 Xray 二进制，搜索结果："
+    find /usr /opt -name 'xray' 2>/dev/null || echo "  (无)"
+    exit 1
+fi
+echo "[INFO] 中转机 Xray 路径: \$XRAY_BIN"
 
 echo "[INFO] 写入入站配置: \$INBOUND_FILE"
 cat > "\$INBOUND_FILE" << 'INBOUND_EOF'

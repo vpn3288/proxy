@@ -58,9 +58,71 @@ install_xray() {
         return
     fi
     info "安装 Xray..."
-    bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh) @ latest
+
+    # 方法1：官方安装脚本（新版语法）
+    if bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) \
+        install 2>/dev/null && [[ -f "$XRAY_BIN" ]]; then
+        success "Xray 安装完成（官方脚本）"
+        return
+    fi
+
+    # 方法2：直接下载二进制（备用）
+    warn "官方脚本安装失败，尝试直接下载二进制..."
+    local arch
+    arch=$(uname -m)
+    local xray_arch
+    case "$arch" in
+        x86_64)  xray_arch="64" ;;
+        aarch64) xray_arch="arm64-v8a" ;;
+        armv7*)  xray_arch="arm32-v7a" ;;
+        *)       error "不支持的 CPU 架构: $arch" ;;
+    esac
+
+    local latest_ver
+    latest_ver=$(curl -fsSL \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+        2>/dev/null | grep '"tag_name"' | cut -d'"' -f4 || echo "v24.9.30")
+
+    local dl_url="https://github.com/XTLS/Xray-core/releases/download/${latest_ver}/Xray-linux-${xray_arch}.zip"
+    info "下载 Xray ${latest_ver} (${xray_arch})..."
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    if curl -fsSL -o "${tmpdir}/xray.zip" "$dl_url" 2>/dev/null; then
+        unzip -q "${tmpdir}/xray.zip" -d "${tmpdir}/" 2>/dev/null
+        install -m 755 "${tmpdir}/xray" "$XRAY_BIN"
+        mkdir -p "$CONFIG_DIR" /var/log/xray
+        rm -rf "$tmpdir"
+        success "Xray 安装完成（直接下载）"
+    else
+        rm -rf "$tmpdir"
+        error "Xray 安装失败，请检查网络连接后重试"
+    fi
+
     [[ -f "$XRAY_BIN" ]] || error "Xray 安装失败"
-    success "Xray 安装完成"
+    # 注册 systemd 服务
+    if [[ ! -f /etc/systemd/system/xray.service ]]; then
+        cat > /etc/systemd/system/xray.service << 'SVCEOF'
+[Unit]
+Description=Xray Service
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+        systemctl daemon-reload
+    fi
 }
 
 # ── 获取公网 IP ────────────────────────────────────────────

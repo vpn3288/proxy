@@ -43,7 +43,10 @@ detect_os() {
 install_deps() {
     info "安装依赖..."
     if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        apt-get update -qq
+        # 清理残留的坏第三方源，防止 apt update 报错中断
+        rm -f /etc/apt/sources.list.d/nginx.list
+        rm -f /etc/apt/sources.list.d/*nginx*
+        apt-get update -qq 2>/dev/null || apt-get update -qq
         apt-get install -y -qq curl wget unzip openssl uuid-runtime jq 2>/dev/null || \
         apt-get install -y -qq curl wget unzip openssl jq
     elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "fedora" ]]; then

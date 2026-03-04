@@ -569,6 +569,33 @@ cat > "\$ROUTING_FILE" << 'ROUTING_EOF'
 }
 ROUTING_EOF
 
+# ── 检查出站直连配置，确保落地机流量从本机 IP 出站 ─────────
+# 检查 v2ray-agent 是否有 direct 出站，若无则补充
+DIRECT_CONF="${v_zz_conf_dir}/relay_direct_outbound.json"
+if ! grep -rl '"freedom"' "${v_zz_conf_dir}"/ >/dev/null 2>&1; then
+    echo "[INFO] 补充 direct 出站配置（确保落地 IP 正确出站）"
+    cat > "\$DIRECT_CONF" << 'DIRECT_EOF'
+{
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+DIRECT_EOF
+    echo "[OK] direct 出站已补充"
+else
+    echo "[INFO] direct 出站已存在，跳过"
+fi
+
 # ── 更新 nodes.json（全部用字符串字面量，不依赖环境变量）────
 mkdir -p "\$(dirname \$NODES_FILE)"
 python3 << 'PYEOF'

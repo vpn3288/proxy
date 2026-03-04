@@ -40,8 +40,8 @@ rm -f /etc/apt/sources.list.d/nginx.list
 rm -f /etc/apt/sources.list.d/*nginx*
 ```
 
-```bash
 # 更新 apt
+```bash
 apt-get update
 ```
 

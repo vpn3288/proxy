@@ -49,8 +49,9 @@ print_banner() {
 # 动态查找 Xray 二进制（本机落地机用）
 # ============================================================
 find_xray_bin() {
-    # 方法1: 常见固定路径
+    # 方法1: 常见固定路径（含 v2ray-agent 实际安装路径）
     local candidates=(
+        "/etc/v2ray-agent/xray/xray"
         "/usr/local/bin/xray"
         "/usr/bin/xray"
         "/usr/local/share/xray/xray"
@@ -63,17 +64,17 @@ find_xray_bin() {
     local w
     w=$(command -v xray 2>/dev/null || echo "")
     [[ -n "$w" && -x "$w" ]] && { echo "$w"; return 0; }
-    # 方法3: 从 systemd 服务文件提取实际路径
+    # 方法3: 从 systemd 服务文件提取实际路径（兼容不支持 grep -P 的系统）
     local svc_bin
-    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null         | grep -oP 'path=\K[^;]+' | head -1 | tr -d '[:space:]')
+    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null         | grep -o 'path=[^;]*' | head -1 | sed 's/path=//' | tr -d ' ')
     [[ -n "$svc_bin" && -x "$svc_bin" ]] && { echo "$svc_bin"; return 0; }
     # 方法4: 从运行中的进程提取
     local proc_bin
     proc_bin=$(ps -eo cmd --no-headers 2>/dev/null         | grep -v grep | grep -i 'xray' | awk '{print $1}' | head -1)
     [[ -n "$proc_bin" && -x "$proc_bin" ]] && { echo "$proc_bin"; return 0; }
-    # 方法5: 全盘搜索（兜底）
+    # 方法5: 全盘搜索（兜底，覆盖任意安装位置）
     local found
-    found=$(find /usr /opt /root -maxdepth 5 -name 'xray' -type f         -perm /111 2>/dev/null | head -1)
+    found=$(find / -maxdepth 6 -name 'xray' -type f         -perm /111 2>/dev/null | grep -v proc | head -1)
     [[ -n "$found" ]] && { echo "$found"; return 0; }
     return 1
 }
@@ -447,16 +448,16 @@ INBOUND_FILE="${v_zz_conf_dir}/relay_inbound_${v_node_tag}.json"
 OUTBOUND_FILE="${v_zz_conf_dir}/relay_outbound_${v_node_tag}.json"
 ROUTING_FILE="${v_zz_conf_dir}/relay_routing_${v_node_tag}.json"
 NODES_FILE="${v_nodes_file}"
-# 方法1: 常见固定路径
-for _p in /usr/local/bin/xray /usr/bin/xray /usr/local/share/xray/xray /opt/xray/xray; do
+# 方法1: 常见固定路径（含 v2ray-agent 实际安装路径）
+for _p in /etc/v2ray-agent/xray/xray /usr/local/bin/xray /usr/bin/xray /usr/local/share/xray/xray /opt/xray/xray; do
     [[ -x "\$_p" ]] && { XRAY_BIN="\$_p"; break; }
 done
 # 方法2: PATH 查找
 [[ -z "\$XRAY_BIN" ]] && XRAY_BIN=\$(command -v xray 2>/dev/null || echo "")
-# 方法3: 从 systemd 服务文件提取实际路径
+# 方法3: 从 systemd 服务文件提取（兼容不支持 grep -P 的系统）
 if [[ -z "\$XRAY_BIN" ]]; then
     _svc_bin=\$(systemctl show xray --property=ExecStart 2>/dev/null \
-        | grep -oP 'path=\K[^;]+' | head -1 | tr -d '[:space:]')
+        | grep -o 'path=[^;]*' | head -1 | sed 's/path=//' | tr -d ' ')
     [[ -n "\$_svc_bin" && -x "\$_svc_bin" ]] && XRAY_BIN="\$_svc_bin"
 fi
 # 方法4: 从运行中的进程提取
@@ -465,14 +466,14 @@ if [[ -z "\$XRAY_BIN" ]]; then
         | grep -v grep | grep -i 'xray' | awk '{print \$1}' | head -1)
     [[ -n "\$_proc_bin" && -x "\$_proc_bin" ]] && XRAY_BIN="\$_proc_bin"
 fi
-# 方法5: 全盘搜索（最慢，兜底）
+# 方法5: 全盘搜索（兜底，覆盖任意安装位置）
 if [[ -z "\$XRAY_BIN" ]]; then
-    XRAY_BIN=\$(find /usr /opt /root -maxdepth 5 -name 'xray' -type f \
-        -perm /111 2>/dev/null | head -1)
+    XRAY_BIN=\$(find / -maxdepth 6 -name 'xray' -type f \
+        -perm /111 2>/dev/null | grep -v proc | head -1)
 fi
 if [[ -z "\$XRAY_BIN" ]]; then
     echo "[ERROR] 中转机未找到 Xray 二进制，搜索结果："
-    find /usr /opt -name 'xray' 2>/dev/null || echo "  (无)"
+    find / -name 'xray' -type f 2>/dev/null | grep -v proc || echo "  (无)"
     exit 1
 fi
 echo "[INFO] 中转机 Xray 路径: \$XRAY_BIN"

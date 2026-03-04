@@ -1,9 +1,11 @@
 #!/bin/bash
 # ============================================================
-# duijie.sh — 落地机与中转机对接脚本 v2.1
-# 功能：在落地机上运行，SSH 到中转机自动添加入站+出站配置
-# 支持：密码认证 / 密钥文件路径 / 粘贴私钥内容（甲骨文云等）
-# 使用：bash <(curl -s https://your-host/duijie.sh)
+# duijie.sh — 落地机与中转机对接脚本 v3.0
+# 功能：在落地机上运行，SSH 到中转机，在 v2ray-agent 的
+#       Xray conf 目录中注入新的入站+出站+路由配置文件
+# 支持：密码 / 密钥文件 / 粘贴私钥内容（甲骨文云）
+# 前提：落地机和中转机都已安装 v2ray-agent
+# 使用：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/duijie.sh)
 # ============================================================
 
 set -e
@@ -23,7 +25,6 @@ LUODI_INFO_FILE="/root/xray_luodi_info.txt"
 XRAY_BIN="/usr/local/bin/xray"
 TEMP_KEY=""
 
-# ── 退出时清理临时密钥文件 ────────────────────────────────
 cleanup() {
     [[ -n "$TEMP_KEY" && -f "$TEMP_KEY" ]] && rm -f "$TEMP_KEY"
 }
@@ -31,7 +32,22 @@ trap cleanup EXIT
 
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本"
 
-# ── 安装依赖 ───────────────────────────────────────────────
+# ============================================================
+print_banner() {
+    echo -e "${CYAN}"
+    echo "  ██████╗ ██╗   ██╗██╗     ██╗██╗███████╗"
+    echo "  ██╔══██╗██║   ██║██║     ██║██║██╔════╝"
+    echo "  ██║  ██║██║   ██║██║     ██║██║█████╗  "
+    echo "  ██║  ██║██║   ██║██║██   ██║██║██╔══╝  "
+    echo "  ██████╔╝╚██████╔╝██║╚█████╔╝██║███████╗"
+    echo "  ╚═════╝  ╚═════╝ ╚═╝ ╚════╝ ╚═╝╚══════╝"
+    echo -e "  落地机 ↔ 中转机 对接脚本 v3.0${NC}"
+    echo ""
+}
+
+# ============================================================
+# 安装依赖
+# ============================================================
 check_deps() {
     local missing=()
     for cmd in ssh jq curl openssl python3; do
@@ -40,6 +56,9 @@ check_deps() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         info "安装缺失依赖: ${missing[*]}"
         if command -v apt-get &>/dev/null; then
+            rm -f /etc/apt/sources.list.d/nginx.list
+            rm -f /etc/apt/sources.list.d/*nginx* 2>/dev/null || true
+            apt-get update -qq 2>/dev/null || true
             apt-get install -y -qq openssh-client jq curl openssl python3 2>/dev/null || true
         elif command -v yum &>/dev/null; then
             yum install -y -q openssh-clients jq curl openssl python3 2>/dev/null || true
@@ -47,46 +66,52 @@ check_deps() {
     fi
 }
 
-# ── 读取落地机信息 ─────────────────────────────────────────
+# ============================================================
+# 读取落地机信息（从 luodi.sh 生成的文件）
+# ============================================================
 read_luodi_info() {
     info "读取落地机配置信息..."
     [[ ! -f "$LUODI_INFO_FILE" ]] && \
-        error "未找到 $LUODI_INFO_FILE，请先在落地机上运行 luodi.sh"
+        error "未找到 $LUODI_INFO_FILE\n请先在落地机上运行 luodi.sh"
 
     LUODI_IP=$(grep      "^LUODI_IP="      "$LUODI_INFO_FILE" | cut -d= -f2)
     LUODI_PORT=$(grep    "^LUODI_PORT="    "$LUODI_INFO_FILE" | cut -d= -f2)
     LUODI_UUID=$(grep    "^LUODI_UUID="    "$LUODI_INFO_FILE" | cut -d= -f2)
     LUODI_PUBKEY=$(grep  "^LUODI_PUBKEY="  "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_PRIVKEY=$(grep "^LUODI_PRIVKEY=" "$LUODI_INFO_FILE" | cut -d= -f2)
     LUODI_SHORTID=$(grep "^LUODI_SHORTID=" "$LUODI_INFO_FILE" | cut -d= -f2)
     LUODI_SNI=$(grep     "^LUODI_SNI="     "$LUODI_INFO_FILE" | cut -d= -f2)
 
-    [[ -z "$LUODI_IP" || -z "$LUODI_PORT" || -z "$LUODI_UUID" ]] && \
+    [[ -z "$LUODI_IP" || -z "$LUODI_PORT" || -z "$LUODI_UUID" || -z "$LUODI_PUBKEY" ]] && \
         error "落地机信息不完整，请重新运行 luodi.sh"
 
     success "落地机信息读取成功"
     printf "  %-8s: ${CYAN}%s${NC}\n" "IP"   "$LUODI_IP"
     printf "  %-8s: ${CYAN}%s${NC}\n" "端口" "$LUODI_PORT"
     printf "  %-8s: ${CYAN}%s${NC}\n" "UUID" "$LUODI_UUID"
+    printf "  %-8s: ${CYAN}%s${NC}\n" "SNI"  "$LUODI_SNI"
 }
 
-# ── 扫描本机已有 SSH 私钥 ──────────────────────────────────
+# ============================================================
+# 扫描本机 SSH 私钥
+# ============================================================
 scan_ssh_keys() {
     local keys=()
     for f in ~/.ssh/id_rsa ~/.ssh/id_ed25519 ~/.ssh/id_ecdsa \
-              ~/.ssh/oracle_key ~/.ssh/oci_key /root/.ssh/id_rsa \
-              /root/.ssh/id_ed25519; do
+              /root/.ssh/id_rsa /root/.ssh/id_ed25519; do
         f_real=$(eval echo "$f")
         [[ -f "$f_real" ]] && keys+=("$f_real")
     done
-    # 还搜索 /root 下 .pem 文件
     while IFS= read -r pem; do
         keys+=("$pem")
     done < <(find /root -maxdepth 2 -name "*.pem" 2>/dev/null)
     echo "${keys[@]}"
 }
 
-# ── 配置 SSH 连接 ──────────────────────────────────────────
-get_zhongzhuan_ssh() {
+# ============================================================
+# 配置 SSH 连接信息
+# ============================================================
+get_ssh_config() {
     echo ""
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
     echo -e "${YELLOW}  配置中转机 SSH 连接${NC}"
@@ -95,7 +120,7 @@ get_zhongzhuan_ssh() {
 
     echo "请选择对接方式："
     echo "  1) SSH 自动对接（推荐）"
-    echo "  2) 手动模式（脚本输出配置片段，手动粘贴到中转机）"
+    echo "  2) 手动模式（输出配置片段，手动粘贴到中转机）"
     read -rp "选择 [1/2，默认1]: " MODE
     MODE=${MODE:-1}
     if [[ "$MODE" == "2" ]]; then
@@ -104,14 +129,12 @@ get_zhongzhuan_ssh() {
     fi
     MANUAL_MODE=false
 
-    # 中转机地址
     read -rp "中转机 IP 或域名: " ZZ_HOST
     [[ -z "$ZZ_HOST" ]] && error "中转机地址不能为空"
 
     read -rp "SSH 端口 [默认 22]: " ZZ_SSH_PORT
     ZZ_SSH_PORT=${ZZ_SSH_PORT:-22}
 
-    # SSH 用户名
     echo ""
     echo "中转机 SSH 用户名："
     echo "  1) root    （大多数 VPS 默认）"
@@ -127,12 +150,11 @@ get_zhongzhuan_ssh() {
     esac
     info "SSH 用户名: $ZZ_USER"
 
-    # 认证方式
     echo ""
     echo "SSH 认证方式："
     echo "  1) 密码"
     echo "  2) 密钥文件（本地有 .pem / id_rsa 等文件）"
-    echo "  3) 粘贴私钥内容  ← 甲骨文云下载的 .pem 内容，从电脑复制过来"
+    echo "  3) 粘贴私钥内容  ← 甲骨文云推荐"
     read -rp "选择 [1/2/3，默认2]: " AUTH_OPT
     AUTH_OPT=${AUTH_OPT:-2}
 
@@ -145,7 +167,6 @@ get_zhongzhuan_ssh() {
     _test_ssh
 }
 
-# ── 认证1：密码 ────────────────────────────────────────────
 _setup_password() {
     AUTH_TYPE="password"
     read -rsp "SSH 密码: " ZZ_PASS
@@ -159,7 +180,6 @@ _setup_password() {
     SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 }
 
-# ── 认证2：密钥文件路径 ────────────────────────────────────
 _setup_keyfile() {
     AUTH_TYPE="keyfile"
     local found_keys
@@ -167,22 +187,22 @@ _setup_keyfile() {
 
     if [[ ${#found_keys[@]} -gt 0 ]]; then
         echo ""
-        echo "检测到以下密钥文件，选择或手动输入路径："
+        echo "检测到以下密钥文件："
         local i
         for i in "${!found_keys[@]}"; do
             echo "  $((i+1))) ${found_keys[$i]}"
         done
-        echo "  $((${#found_keys[@]}+1))) 手动输入"
+        echo "  $((${#found_keys[@]}+1))) 手动输入路径"
         read -rp "选择 [默认1]: " K_OPT
         K_OPT=${K_OPT:-1}
         if [[ "$K_OPT" -le "${#found_keys[@]}" ]] 2>/dev/null; then
             ZZ_KEY="${found_keys[$((K_OPT-1))]}"
         else
-            read -rp "密钥路径 (支持 ~ 展开): " ZZ_KEY
+            read -rp "密钥路径: " ZZ_KEY
             ZZ_KEY=$(eval echo "$ZZ_KEY")
         fi
     else
-        read -rp "密钥文件路径 [如 /root/oracle.pem 或 ~/.ssh/id_rsa]: " ZZ_KEY
+        read -rp "密钥文件路径 [如 /root/oracle.pem]: " ZZ_KEY
         ZZ_KEY=$(eval echo "$ZZ_KEY")
     fi
 
@@ -192,33 +212,28 @@ _setup_keyfile() {
     SSH_OPTS="-i $ZZ_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
 }
 
-# ── 认证3：粘贴私钥内容 ────────────────────────────────────
 _setup_paste_key() {
     AUTH_TYPE="keyfile"
     echo ""
-    echo -e "${YELLOW}请粘贴私钥内容（以 -----BEGIN ... PRIVATE KEY----- 开头）${NC}"
+    echo -e "${YELLOW}请粘贴私钥内容（-----BEGIN ... PRIVATE KEY----- 开头）${NC}"
     echo -e "${YELLOW}粘贴完成后，新起一行输入 END 并回车：${NC}"
     echo ""
-
     local key_lines=""
     local line
     while IFS= read -r line; do
         [[ "$line" == "END" ]] && break
         key_lines+="${line}"$'\n'
     done
-
     echo "$key_lines" | grep -q "PRIVATE KEY" || \
         error "内容不包含 PRIVATE KEY，请确认粘贴了完整私钥"
-
     TEMP_KEY=$(mktemp /tmp/.ssh_key_XXXXXX)
     chmod 600 "$TEMP_KEY"
     printf '%s' "$key_lines" > "$TEMP_KEY"
     ZZ_KEY="$TEMP_KEY"
-    info "私钥已写入临时文件（脚本结束后自动删除）"
     SSH_OPTS="-i $ZZ_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+    info "私钥已写入临时文件（退出后自动删除）"
 }
 
-# ── 测试 SSH 连通性 ────────────────────────────────────────
 _test_ssh() {
     info "测试 SSH 连接 ${ZZ_USER}@${ZZ_HOST}:${ZZ_SSH_PORT} ..."
     local out
@@ -226,20 +241,17 @@ _test_ssh() {
     if echo "$out" | grep -q "__CONN_OK__"; then
         success "SSH 连接成功 ✓"
     else
-        echo -e "${RED}连接失败，原始错误：${NC}"
+        echo -e "${RED}连接失败：${NC}"
         echo "$out"
         echo ""
-        echo -e "${YELLOW}甲骨文云常见问题排查：${NC}"
-        echo "  1. 安全组/NSG 需放行 SSH 端口（默认22）"
-        echo "  2. Ubuntu 镜像用 ubuntu，Oracle Linux 镜像用 opc"
-        echo "  3. 密钥需与创建实例时上传的公钥对应"
-        echo "  4. 如果用密码方式，甲骨文默认禁用密码登录，需改用密钥"
-        echo "  5. .pem 文件需 chmod 600"
-        error "请检查后重试"
+        echo -e "${YELLOW}排查建议：${NC}"
+        echo "  1. 安全组需放行 SSH 端口"
+        echo "  2. 甲骨文 Ubuntu 用 ubuntu，Oracle Linux 用 opc"
+        echo "  3. 密钥需与创建实例时对应"
+        error "SSH 连接失败，请检查后重试"
     fi
 }
 
-# ── 统一执行远端命令 ───────────────────────────────────────
 _ssh_run() {
     local cmd="$1"
     if [[ "$AUTH_TYPE" == "password" ]]; then
@@ -249,7 +261,6 @@ _ssh_run() {
     fi
 }
 
-# ── 统一向远端传入脚本（stdin） ────────────────────────────
 _ssh_pipe() {
     if [[ "$AUTH_TYPE" == "password" ]]; then
         sshpass -p "$ZZ_PASS" ssh $SSH_OPTS -p "$ZZ_SSH_PORT" "$ZZ_USER@$ZZ_HOST" bash -s
@@ -258,7 +269,9 @@ _ssh_pipe() {
     fi
 }
 
-# ── 获取下一个可用端口 ─────────────────────────────────────
+# ============================================================
+# 获取中转机下一个可用端口
+# ============================================================
 get_next_port() {
     info "查询中转机端口分配情况..."
 
@@ -267,10 +280,16 @@ get_next_port() {
 
     START_PORT=$(echo "$ZZ_META" | grep "^ZHONGZHUAN_START_PORT=" | cut -d= -f2)
     MAX_NODES=$(echo  "$ZZ_META" | grep "^ZHONGZHUAN_MAX_NODES="  | cut -d= -f2)
-    START_PORT=${START_PORT:-10001}
+    ZZ_CONF_DIR=$(echo "$ZZ_META" | grep "^ZHONGZHUAN_CONF_DIR=" | cut -d= -f2)
+    START_PORT=${START_PORT:-30001}
     MAX_NODES=${MAX_NODES:-20}
+    ZZ_CONF_DIR=${ZZ_CONF_DIR:-/etc/v2ray-agent/xray/conf}
 
-    USED_PORTS=$(echo "$NODES_JSON" | jq -r '.nodes[].inbound_port' 2>/dev/null || echo "")
+    USED_PORTS=$(echo "$NODES_JSON" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for n in d.get('nodes',[]): print(n.get('inbound_port',''))
+" 2>/dev/null || echo "")
 
     NEXT_PORT=""
     for ((p=START_PORT; p<START_PORT+MAX_NODES; p++)); do
@@ -287,258 +306,300 @@ get_next_port() {
     info "本次使用端口: $NEXT_PORT"
 }
 
-# ── 生成中转机入站 Reality 密钥对 ─────────────────────────
+# ============================================================
+# 生成中转机入站的独立 Reality 密钥对
+# ============================================================
 gen_relay_keys() {
     info "生成中转机入站 Reality 密钥对..."
-    if [[ -f "$XRAY_BIN" ]]; then
-        local kout
-        kout=$("$XRAY_BIN" x25519 2>/dev/null)
-        RELAY_PRIVKEY=$(echo "$kout" | grep "Private key:" | awk '{print $3}')
-        RELAY_PUBKEY=$(echo  "$kout" | grep "Public key:"  | awk '{print $3}')
-    else
-        warn "本机无 xray，使用 fallback 密钥（建议先运行 luodi.sh）"
-        RELAY_PRIVKEY="$LUODI_PUBKEY"
-        RELAY_PUBKEY="$LUODI_PUBKEY"
-    fi
+
+    local xray_bin="/usr/local/bin/xray"
+    [[ ! -f "$xray_bin" ]] && xray_bin=$(command -v xray 2>/dev/null || echo "")
+    [[ -z "$xray_bin" ]] && error "未找到 xray，请确认落地机已安装 v2ray-agent"
+
+    local key_out
+    key_out=$("$xray_bin" x25519 2>/dev/null)
+
+    # 兼容 v26 新格式（PrivateKey/Password）和旧格式（Private key/Public key）
+    RELAY_PRIVKEY=$(echo "$key_out" | grep -i "^PrivateKey:" | awk '{print $NF}' | tr -d '[:space:]')
+    RELAY_PUBKEY=$(echo  "$key_out" | grep -i "^Password:"   | awk '{print $NF}' | tr -d '[:space:]')
+    # 兼容旧格式
+    [[ -z "$RELAY_PRIVKEY" ]] && \
+        RELAY_PRIVKEY=$(echo "$key_out" | grep -i "^Private key:" | awk '{print $NF}' | tr -d '[:space:]')
+    [[ -z "$RELAY_PUBKEY" ]] && \
+        RELAY_PUBKEY=$(echo  "$key_out" | grep -i "^Public key:"  | awk '{print $NF}' | tr -d '[:space:]')
+
+    [[ -z "$RELAY_PRIVKEY" || -z "$RELAY_PUBKEY" ]] && \
+        error "密钥生成失败，原始输出:\n$key_out"
+
     RELAY_SHORTID=$(openssl rand -hex 8)
-    NODE_TAG="node-$(echo "$LUODI_IP" | tr '.' '-')-${NEXT_PORT}"
+    NODE_TAG="relay-$(echo "$LUODI_IP" | tr '.' '-')-${NEXT_PORT}"
+    info "中转入站公钥: $RELAY_PUBKEY"
 }
 
-# ── 注入配置到中转机 ───────────────────────────────────────
+# ============================================================
+# 注入配置到中转机（写入独立 json 文件，不修改原有配置）
+# ============================================================
 inject_config() {
-    info "将配置注入到中转机..."
+    info "注入配置到中转机 v2ray-agent..."
 
-    # 通过管道传入 bash 脚本，脚本内用 python3 操作 JSON
-    # 所有变量通过 export 传递给远端 python3
-    _ssh_pipe <<REMOTE_SCRIPT
-export NODE_TAG="${NODE_TAG}"
-export NEXT_PORT="${NEXT_PORT}"
-export LUODI_IP="${LUODI_IP}"
-export LUODI_PORT="${LUODI_PORT}"
-export LUODI_UUID="${LUODI_UUID}"
-export LUODI_PUBKEY="${LUODI_PUBKEY}"
-export LUODI_SHORTID="${LUODI_SHORTID}"
-export LUODI_SNI="${LUODI_SNI}"
-export RELAY_PRIVKEY="${RELAY_PRIVKEY}"
-export RELAY_PUBKEY="${RELAY_PUBKEY}"
-export RELAY_SHORTID="${RELAY_SHORTID}"
-export ADDED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
-
+    _ssh_pipe << REMOTE_SCRIPT
+#!/bin/bash
 set -e
-CFG="/usr/local/etc/xray/config.json"
-NDS="/usr/local/etc/xray/nodes.json"
 
-[[ ! -f "\$CFG" ]] && echo "[ERROR] 中转机配置文件不存在: \$CFG" && exit 1
+# 所有变量通过 heredoc 展开传入
+NODE_TAG="${NODE_TAG}"
+NEXT_PORT="${NEXT_PORT}"
+LUODI_IP="${LUODI_IP}"
+LUODI_PORT="${LUODI_PORT}"
+LUODI_UUID="${LUODI_UUID}"
+LUODI_PUBKEY="${LUODI_PUBKEY}"
+LUODI_SHORTID="${LUODI_SHORTID}"
+LUODI_SNI="${LUODI_SNI}"
+RELAY_PRIVKEY="${RELAY_PRIVKEY}"
+RELAY_PUBKEY="${RELAY_PUBKEY}"
+RELAY_SHORTID="${RELAY_SHORTID}"
+ZZ_CONF_DIR="${ZZ_CONF_DIR}"
+NODES_FILE="/usr/local/etc/xray/nodes.json"
+ADDED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# 备份
-cp "\$CFG" "\${CFG}.bak.\$(date +%s)"
+# ── 写入入站配置文件（独立文件，不影响 v2ray-agent 原配置）──
+INBOUND_FILE="\${ZZ_CONF_DIR}/relay_inbound_\${NODE_TAG}.json"
+OUTBOUND_FILE="\${ZZ_CONF_DIR}/relay_outbound_\${NODE_TAG}.json"
+ROUTING_FILE="\${ZZ_CONF_DIR}/relay_routing_\${NODE_TAG}.json"
 
-python3 - <<'PYEOF'
-import json, os, sys
-
-cfg_path   = "/usr/local/etc/xray/config.json"
-nodes_path = "/usr/local/etc/xray/nodes.json"
-e = os.environ
-
-try:
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-except Exception as ex:
-    print(f"[ERROR] 无法解析配置文件: {ex}")
-    sys.exit(1)
-
-tag          = e["NODE_TAG"]
-in_port      = int(e["NEXT_PORT"])
-luodi_ip     = e["LUODI_IP"]
-luodi_port   = int(e["LUODI_PORT"])
-uuid         = e["LUODI_UUID"]
-luodi_pubkey = e["LUODI_PUBKEY"]
-luodi_sid    = e["LUODI_SHORTID"]
-sni          = e["LUODI_SNI"]
-r_privkey    = e["RELAY_PRIVKEY"]
-r_pubkey     = e["RELAY_PUBKEY"]
-r_sid        = e["RELAY_SHORTID"]
-added_at     = e["ADDED_AT"]
-
-# 检查端口是否已存在
-for ib in cfg.get("inbounds", []):
-    if ib.get("port") == in_port:
-        print(f"[ERROR] 端口 {in_port} 已被占用，请换一个端口")
-        sys.exit(1)
-
-# 入站：用户 → 中转机（Reality 在中转机终结）
-new_in = {
-    "tag": f"{tag}-in",
-    "listen": "0.0.0.0",
-    "port": in_port,
-    "protocol": "vless",
-    "settings": {
-        "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+echo "[INFO] 写入入站配置: \$INBOUND_FILE"
+cat > "\$INBOUND_FILE" << INBOUND_EOF
+{
+  "inbounds": [
+    {
+      "tag": "\${NODE_TAG}-in",
+      "listen": "0.0.0.0",
+      "port": \${NEXT_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "\${LUODI_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
         "decryption": "none"
-    },
-    "streamSettings": {
+      },
+      "streamSettings": {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-            "show": False,
-            "dest": f"{sni}:443",
-            "xver": 0,
-            "serverNames": [sni],
-            "privateKey": r_privkey,
-            "shortIds": [r_sid]
+          "show": false,
+          "dest": "\${LUODI_SNI}:443",
+          "xver": 0,
+          "serverNames": ["\${LUODI_SNI}"],
+          "privateKey": "\${RELAY_PRIVKEY}",
+          "shortIds": ["\${RELAY_SHORTID}"]
         }
-    },
-    "sniffing": {"enabled": True, "destOverride": ["http","tls","quic"]}
-}
-
-# 出站：中转机 → 落地机（Reality 连落地机）
-new_out = {
-    "tag": f"{tag}-out",
-    "protocol": "vless",
-    "settings": {
-        "vnext": [{
-            "address": luodi_ip,
-            "port": luodi_port,
-            "users": [{"id": uuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
-        }]
-    },
-    "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-            "fingerprint": "chrome",
-            "serverName": sni,
-            "publicKey": luodi_pubkey,
-            "shortId": luodi_sid
-        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
     }
+  ]
+}
+INBOUND_EOF
+
+echo "[INFO] 写入出站配置: \$OUTBOUND_FILE"
+cat > "\$OUTBOUND_FILE" << OUTBOUND_EOF
+{
+  "outbounds": [
+    {
+      "tag": "\${NODE_TAG}-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "\${LUODI_IP}",
+            "port": \${LUODI_PORT},
+            "users": [
+              {
+                "id": "\${LUODI_UUID}",
+                "flow": "xtls-rprx-vision",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "serverName": "\${LUODI_SNI}",
+          "publicKey": "\${LUODI_PUBKEY}",
+          "shortId": "\${LUODI_SHORTID}"
+        }
+      }
+    }
+  ]
+}
+OUTBOUND_EOF
+
+echo "[INFO] 写入路由配置: \$ROUTING_FILE"
+cat > "\$ROUTING_FILE" << ROUTING_EOF
+{
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["\${NODE_TAG}-in"],
+        "outboundTag": "\${NODE_TAG}-out"
+      }
+    ]
+  }
+}
+ROUTING_EOF
+
+# ── 更新 nodes.json 记录 ─────────────────────────────────
+mkdir -p "\$(dirname \$NODES_FILE)"
+python3 - << PYEOF
+import json, os
+
+nodes_path = os.environ.get("NODES_FILE", "/usr/local/etc/xray/nodes.json")
+# 从 bash 变量读取（已通过 heredoc 展开）
+node = {
+    "tag":           "${NODE_TAG}",
+    "luodi_ip":      "${LUODI_IP}",
+    "luodi_port":    int("${LUODI_PORT}"),
+    "inbound_port":  int("${NEXT_PORT}"),
+    "relay_pubkey":  "${RELAY_PUBKEY}",
+    "relay_shortid": "${RELAY_SHORTID}",
+    "uuid":          "${LUODI_UUID}",
+    "inbound_file":  "${ZZ_CONF_DIR}/relay_inbound_${NODE_TAG}.json",
+    "added_at":      "${ADDED_AT}"
 }
 
-# 路由：该入站 → 该出站（插最前确保优先命中）
-new_rule = {
-    "type": "field",
-    "inboundTag": [f"{tag}-in"],
-    "outboundTag": f"{tag}-out"
-}
-
-cfg.setdefault("inbounds",  []).append(new_in)
-cfg.setdefault("outbounds", []).append(new_out)
-cfg.setdefault("routing", {}).setdefault("rules", []).insert(0, new_rule)
-
-with open(cfg_path, "w") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-# 更新节点记录
 try:
     with open(nodes_path) as f:
         nodes = json.load(f)
 except Exception:
     nodes = {"nodes": []}
 
-nodes["nodes"].append({
-    "tag":           tag,
-    "luodi_ip":      luodi_ip,
-    "luodi_port":    luodi_port,
-    "inbound_port":  in_port,
-    "relay_pubkey":  r_pubkey,
-    "relay_shortid": r_sid,
-    "uuid":          uuid,
-    "added_at":      added_at
-})
+# 如果同 tag 已存在则更新
+nodes["nodes"] = [n for n in nodes["nodes"] if n.get("tag") != node["tag"]]
+nodes["nodes"].append(node)
 
 with open(nodes_path, "w") as f:
     json.dump(nodes, f, indent=2, ensure_ascii=False)
-
-print("[OK] 配置注入成功")
+print("[OK] nodes.json 已更新")
 PYEOF
+
+# ── 验证配置并重启 Xray ──────────────────────────────────
+echo "[INFO] 验证 Xray 配置..."
+if /usr/local/bin/xray -test -config /etc/v2ray-agent/xray/conf/00_log.json 2>/dev/null; then
+    echo "[INFO] 配置验证通过"
+else
+    echo "[WARN] 配置验证命令不支持多文件模式，跳过验证直接重启"
+fi
+
+echo "[INFO] 重启 Xray 服务..."
+systemctl restart xray
+sleep 3
+if systemctl is-active --quiet xray; then
+    echo "[OK] Xray 重启成功"
+else
+    echo "[ERROR] Xray 重启失败，日志："
+    journalctl -u xray -n 20 --no-pager
+    exit 1
+fi
 REMOTE_SCRIPT
 
     success "配置注入完成"
-
-    # 重启中转机 Xray
-    info "重启中转机 Xray 服务..."
-    local st
-    st=$(_ssh_run "systemctl restart xray 2>&1; sleep 2; systemctl is-active xray 2>&1" || echo "unknown")
-    if echo "$st" | grep -q "^active"; then
-        success "中转机 Xray 重启成功 ✓"
-    else
-        warn "Xray 状态异常，请登录中转机检查："
-        warn "  journalctl -u xray -n 30 --no-pager"
-        warn "  xray -test -c /usr/local/etc/xray/config.json"
-    fi
 }
 
-# ── 手动模式 ───────────────────────────────────────────────
+# ============================================================
+# 手动模式：输出配置内容
+# ============================================================
 manual_mode() {
     echo ""
     echo -e "${YELLOW}══════════ 手动对接模式 ══════════════════════════════${NC}"
-    read -rp "中转机上使用哪个端口？(例如 10001): " NEXT_PORT
+    read -rp "中转机上使用哪个端口？(如 30001): " NEXT_PORT
     [[ -z "$NEXT_PORT" ]] && error "端口不能为空"
 
-    # 手动模式下在本机生成密钥
     gen_relay_keys
+    NODE_TAG="relay-$(echo "$LUODI_IP" | tr '.' '-')-${NEXT_PORT}"
 
     echo ""
-    echo -e "${CYAN}══ 1. 追加到中转机 inbounds 数组 ══════════════════════${NC}"
-    python3 - <<PYEOF
-import json
-d = {
+    echo -e "${CYAN}在中转机的 /etc/v2ray-agent/xray/conf/ 目录下创建三个文件：${NC}"
+    echo ""
+    echo -e "${GREEN}── 文件1: relay_inbound_${NODE_TAG}.json ──────────────${NC}"
+    cat << EOF
+{
+  "inbounds": [{
     "tag": "${NODE_TAG}-in",
     "listen": "0.0.0.0",
-    "port": int("${NEXT_PORT}"),
+    "port": ${NEXT_PORT},
     "protocol": "vless",
-    "settings": {"clients":[{"id":"${LUODI_UUID}","flow":"xtls-rprx-vision"}],"decryption":"none"},
-    "streamSettings": {
-        "network":"tcp","security":"reality",
-        "realitySettings":{
-            "show":False,"dest":"${LUODI_SNI}:443","xver":0,
-            "serverNames":["${LUODI_SNI}"],
-            "privateKey":"${RELAY_PRIVKEY}",
-            "shortIds":["${RELAY_SHORTID}"]
-        }
+    "settings": {
+      "clients": [{"id": "${LUODI_UUID}", "flow": "xtls-rprx-vision"}],
+      "decryption": "none"
     },
-    "sniffing":{"enabled":True,"destOverride":["http","tls","quic"]}
-}
-print(json.dumps(d,indent=2,ensure_ascii=False))
-PYEOF
-
-    echo ""
-    echo -e "${CYAN}══ 2. 追加到中转机 outbounds 数组 ═════════════════════${NC}"
-    python3 - <<PYEOF
-import json
-d = {
-    "tag": "${NODE_TAG}-out",
-    "protocol":"vless",
-    "settings":{"vnext":[{"address":"${LUODI_IP}","port":int("${LUODI_PORT}"),
-        "users":[{"id":"${LUODI_UUID}","flow":"xtls-rprx-vision","encryption":"none"}]}]},
-    "streamSettings":{
-        "network":"tcp","security":"reality",
-        "realitySettings":{"fingerprint":"chrome","serverName":"${LUODI_SNI}",
-            "publicKey":"${LUODI_PUBKEY}","shortId":"${LUODI_SHORTID}"}
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${LUODI_SNI}:443",
+        "xver": 0,
+        "serverNames": ["${LUODI_SNI}"],
+        "privateKey": "${RELAY_PRIVKEY}",
+        "shortIds": ["${RELAY_SHORTID}"]
+      }
     }
+  }]
 }
-print(json.dumps(d,indent=2,ensure_ascii=False))
-PYEOF
+EOF
 
     echo ""
-    echo -e "${CYAN}══ 3. 插入到 routing.rules 数组最前面 ══════════════════${NC}"
-    echo "{\"type\":\"field\",\"inboundTag\":[\"${NODE_TAG}-in\"],\"outboundTag\":\"${NODE_TAG}-out\"}"
+    echo -e "${GREEN}── 文件2: relay_outbound_${NODE_TAG}.json ─────────────${NC}"
+    cat << EOF
+{
+  "outbounds": [{
+    "tag": "${NODE_TAG}-out",
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{"address": "${LUODI_IP}", "port": ${LUODI_PORT},
+        "users": [{"id": "${LUODI_UUID}", "flow": "xtls-rprx-vision", "encryption": "none"}]
+      }]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "fingerprint": "chrome",
+        "serverName": "${LUODI_SNI}",
+        "publicKey": "${LUODI_PUBKEY}",
+        "shortId": "${LUODI_SHORTID}"
+      }
+    }
+  }]
+}
+EOF
 
     echo ""
-    echo -e "${YELLOW}4. 中转机执行: systemctl restart xray${NC}"
+    echo -e "${GREEN}── 文件3: relay_routing_${NODE_TAG}.json ──────────────${NC}"
+    cat << EOF
+{
+  "routing": {
+    "rules": [{"type": "field", "inboundTag": ["${NODE_TAG}-in"], "outboundTag": "${NODE_TAG}-out"}]
+  }
+}
+EOF
     echo ""
-    echo -e "${YELLOW}客户端参数（连中转机）：${NC}"
-    echo "  地址   : <中转机IP>"
-    echo "  端口   : $NEXT_PORT"
-    echo "  UUID   : $LUODI_UUID"
-    echo "  Flow   : xtls-rprx-vision"
-    echo "  pbk    : $RELAY_PUBKEY   ← 中转机入站公钥"
-    echo "  sid    : $RELAY_SHORTID"
-    echo "  sni    : $LUODI_SNI"
-    echo "  fp     : chrome"
+    echo -e "${YELLOW}完成后执行: systemctl restart xray${NC}"
 }
 
-# ── 输出客户端节点链接 ─────────────────────────────────────
+# ============================================================
+# 输出客户端节点链接
+# ============================================================
 gen_client_link() {
     local zz="${ZZ_HOST:-<中转机IP>}"
     local link="vless://${LUODI_UUID}@${zz}:${NEXT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${LUODI_SNI}&fp=chrome&pbk=${RELAY_PUBKEY}&sid=${RELAY_SHORTID}&type=tcp&headerType=none#中转${zz}:${NEXT_PORT}→落地${LUODI_IP}"
@@ -563,21 +624,14 @@ gen_client_link() {
     success "记录已追加到 /root/duijie_records.txt"
 }
 
-# ── 主流程 ─────────────────────────────────────────────────
+# ============================================================
+# 主流程
+# ============================================================
 main() {
-    echo -e "${CYAN}"
-    echo "  ██████╗ ██╗   ██╗██╗     ██╗██╗███████╗"
-    echo "  ██╔══██╗██║   ██║██║     ██║██║██╔════╝"
-    echo "  ██║  ██║██║   ██║██║     ██║██║█████╗  "
-    echo "  ██║  ██║██║   ██║██║██   ██║██║██╔══╝  "
-    echo "  ██████╔╝╚██████╔╝██║╚█████╔╝██║███████╗"
-    echo "  ╚═════╝  ╚═════╝ ╚═╝ ╚════╝ ╚═╝╚══════╝"
-    echo -e "  落地机 ↔ 中转机 对接脚本 v2.1${NC}"
-    echo ""
-
+    print_banner
     check_deps
     read_luodi_info
-    get_zhongzhuan_ssh
+    get_ssh_config
 
     if [[ "$MANUAL_MODE" == "true" ]]; then
         manual_mode

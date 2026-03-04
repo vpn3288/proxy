@@ -1,701 +1,592 @@
 #!/bin/bash
+# ============================================================
+# duijie.sh — 落地机与中转机对接脚本 v2.1
+# 功能：在落地机上运行，SSH 到中转机自动添加入站+出站配置
+# 支持：密码认证 / 密钥文件路径 / 粘贴私钥内容（甲骨文云等）
+# 使用：bash <(curl -s https://your-host/duijie.sh)
+# ============================================================
 
-################################################################################
-#                                                                              #
-#              落地机代理节点对接中转机一键脚本                                  #
-#                         v1.00                                                #
-#                                                                              #
-#  前提条件：                                                                   #
-#    1. 已运行 luodi.sh，WireGuard 隧道已建立                                   #
-#    2. 已安装 v2ray-agent（Xray 或 Sing-box）                                  #
-#                                                                              #
-#  本脚本做的事：                                                                #
-#    1. 读取本机已有的中转机信息（relay-info）                                    #
-#    2. 自动检测代理协议和端口                                                   #
-#    3. SSH 到中转机（10.0.0.1），自动添加端口转发规则                            #
-#    4. 输出最终节点链接（入口=中转机IP，出站=落地机IP）                           #
-#                                                                              #
-################################################################################
+set -e
 
-set -uo pipefail
-
-# ============================================================================
-# 颜色定义
-# ============================================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ============================================================================
-# 打印函数
-# ============================================================================
-print_title() {
-    clear
+info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+success() { echo -e "${CYAN}[OK]${NC} $1"; }
+
+LUODI_INFO_FILE="/root/xray_luodi_info.txt"
+XRAY_BIN="/usr/local/bin/xray"
+TEMP_KEY=""
+
+# ── 退出时清理临时密钥文件 ────────────────────────────────
+cleanup() {
+    [[ -n "$TEMP_KEY" && -f "$TEMP_KEY" ]] && rm -f "$TEMP_KEY"
+}
+trap cleanup EXIT
+
+[[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本"
+
+# ── 安装依赖 ───────────────────────────────────────────────
+check_deps() {
+    local missing=()
+    for cmd in ssh jq curl openssl python3; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        info "安装缺失依赖: ${missing[*]}"
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y -qq openssh-client jq curl openssl python3 2>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum install -y -q openssh-clients jq curl openssl python3 2>/dev/null || true
+        fi
+    fi
+}
+
+# ── 读取落地机信息 ─────────────────────────────────────────
+read_luodi_info() {
+    info "读取落地机配置信息..."
+    [[ ! -f "$LUODI_INFO_FILE" ]] && \
+        error "未找到 $LUODI_INFO_FILE，请先在落地机上运行 luodi.sh"
+
+    LUODI_IP=$(grep      "^LUODI_IP="      "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_PORT=$(grep    "^LUODI_PORT="    "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_UUID=$(grep    "^LUODI_UUID="    "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_PUBKEY=$(grep  "^LUODI_PUBKEY="  "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_SHORTID=$(grep "^LUODI_SHORTID=" "$LUODI_INFO_FILE" | cut -d= -f2)
+    LUODI_SNI=$(grep     "^LUODI_SNI="     "$LUODI_INFO_FILE" | cut -d= -f2)
+
+    [[ -z "$LUODI_IP" || -z "$LUODI_PORT" || -z "$LUODI_UUID" ]] && \
+        error "落地机信息不完整，请重新运行 luodi.sh"
+
+    success "落地机信息读取成功"
+    printf "  %-8s: ${CYAN}%s${NC}\n" "IP"   "$LUODI_IP"
+    printf "  %-8s: ${CYAN}%s${NC}\n" "端口" "$LUODI_PORT"
+    printf "  %-8s: ${CYAN}%s${NC}\n" "UUID" "$LUODI_UUID"
+}
+
+# ── 扫描本机已有 SSH 私钥 ──────────────────────────────────
+scan_ssh_keys() {
+    local keys=()
+    for f in ~/.ssh/id_rsa ~/.ssh/id_ed25519 ~/.ssh/id_ecdsa \
+              ~/.ssh/oracle_key ~/.ssh/oci_key /root/.ssh/id_rsa \
+              /root/.ssh/id_ed25519; do
+        f_real=$(eval echo "$f")
+        [[ -f "$f_real" ]] && keys+=("$f_real")
+    done
+    # 还搜索 /root 下 .pem 文件
+    while IFS= read -r pem; do
+        keys+=("$pem")
+    done < <(find /root -maxdepth 2 -name "*.pem" 2>/dev/null)
+    echo "${keys[@]}"
+}
+
+# ── 配置 SSH 连接 ──────────────────────────────────────────
+get_zhongzhuan_ssh() {
+    echo ""
+    echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}  配置中转机 SSH 连接${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    echo "请选择对接方式："
+    echo "  1) SSH 自动对接（推荐）"
+    echo "  2) 手动模式（脚本输出配置片段，手动粘贴到中转机）"
+    read -rp "选择 [1/2，默认1]: " MODE
+    MODE=${MODE:-1}
+    if [[ "$MODE" == "2" ]]; then
+        MANUAL_MODE=true
+        return
+    fi
+    MANUAL_MODE=false
+
+    # 中转机地址
+    read -rp "中转机 IP 或域名: " ZZ_HOST
+    [[ -z "$ZZ_HOST" ]] && error "中转机地址不能为空"
+
+    read -rp "SSH 端口 [默认 22]: " ZZ_SSH_PORT
+    ZZ_SSH_PORT=${ZZ_SSH_PORT:-22}
+
+    # SSH 用户名
+    echo ""
+    echo "中转机 SSH 用户名："
+    echo "  1) root    （大多数 VPS 默认）"
+    echo "  2) ubuntu  （甲骨文 Ubuntu 镜像）"
+    echo "  3) opc     （甲骨文 Oracle Linux 镜像）"
+    echo "  4) 手动输入"
+    read -rp "选择 [1/2/3/4，默认1]: " USER_OPT
+    case "${USER_OPT:-1}" in
+        2) ZZ_USER="ubuntu" ;;
+        3) ZZ_USER="opc" ;;
+        4) read -rp "用户名: " ZZ_USER ;;
+        *) ZZ_USER="root" ;;
+    esac
+    info "SSH 用户名: $ZZ_USER"
+
+    # 认证方式
+    echo ""
+    echo "SSH 认证方式："
+    echo "  1) 密码"
+    echo "  2) 密钥文件（本地有 .pem / id_rsa 等文件）"
+    echo "  3) 粘贴私钥内容  ← 甲骨文云下载的 .pem 内容，从电脑复制过来"
+    read -rp "选择 [1/2/3，默认2]: " AUTH_OPT
+    AUTH_OPT=${AUTH_OPT:-2}
+
+    case "$AUTH_OPT" in
+        1) _setup_password ;;
+        3) _setup_paste_key ;;
+        *) _setup_keyfile ;;
+    esac
+
+    _test_ssh
+}
+
+# ── 认证1：密码 ────────────────────────────────────────────
+_setup_password() {
+    AUTH_TYPE="password"
+    read -rsp "SSH 密码: " ZZ_PASS
+    echo ""
+    if ! command -v sshpass &>/dev/null; then
+        info "安装 sshpass..."
+        apt-get install -y -qq sshpass 2>/dev/null || \
+        yum install -y -q sshpass 2>/dev/null || \
+        error "sshpass 安装失败，建议改用密钥认证"
+    fi
+    SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+}
+
+# ── 认证2：密钥文件路径 ────────────────────────────────────
+_setup_keyfile() {
+    AUTH_TYPE="keyfile"
+    local found_keys
+    read -ra found_keys <<< "$(scan_ssh_keys)"
+
+    if [[ ${#found_keys[@]} -gt 0 ]]; then
+        echo ""
+        echo "检测到以下密钥文件，选择或手动输入路径："
+        local i
+        for i in "${!found_keys[@]}"; do
+            echo "  $((i+1))) ${found_keys[$i]}"
+        done
+        echo "  $((${#found_keys[@]}+1))) 手动输入"
+        read -rp "选择 [默认1]: " K_OPT
+        K_OPT=${K_OPT:-1}
+        if [[ "$K_OPT" -le "${#found_keys[@]}" ]] 2>/dev/null; then
+            ZZ_KEY="${found_keys[$((K_OPT-1))]}"
+        else
+            read -rp "密钥路径 (支持 ~ 展开): " ZZ_KEY
+            ZZ_KEY=$(eval echo "$ZZ_KEY")
+        fi
+    else
+        read -rp "密钥文件路径 [如 /root/oracle.pem 或 ~/.ssh/id_rsa]: " ZZ_KEY
+        ZZ_KEY=$(eval echo "$ZZ_KEY")
+    fi
+
+    [[ ! -f "$ZZ_KEY" ]] && error "文件不存在: $ZZ_KEY"
+    chmod 600 "$ZZ_KEY"
+    info "使用密钥: $ZZ_KEY"
+    SSH_OPTS="-i $ZZ_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+}
+
+# ── 认证3：粘贴私钥内容 ────────────────────────────────────
+_setup_paste_key() {
+    AUTH_TYPE="keyfile"
+    echo ""
+    echo -e "${YELLOW}请粘贴私钥内容（以 -----BEGIN ... PRIVATE KEY----- 开头）${NC}"
+    echo -e "${YELLOW}粘贴完成后，新起一行输入 END 并回车：${NC}"
+    echo ""
+
+    local key_lines=""
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == "END" ]] && break
+        key_lines+="${line}"$'\n'
+    done
+
+    echo "$key_lines" | grep -q "PRIVATE KEY" || \
+        error "内容不包含 PRIVATE KEY，请确认粘贴了完整私钥"
+
+    TEMP_KEY=$(mktemp /tmp/.ssh_key_XXXXXX)
+    chmod 600 "$TEMP_KEY"
+    printf '%s' "$key_lines" > "$TEMP_KEY"
+    ZZ_KEY="$TEMP_KEY"
+    info "私钥已写入临时文件（脚本结束后自动删除）"
+    SSH_OPTS="-i $ZZ_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+}
+
+# ── 测试 SSH 连通性 ────────────────────────────────────────
+_test_ssh() {
+    info "测试 SSH 连接 ${ZZ_USER}@${ZZ_HOST}:${ZZ_SSH_PORT} ..."
+    local out
+    out=$(_ssh_run "echo __CONN_OK__" 2>&1) || true
+    if echo "$out" | grep -q "__CONN_OK__"; then
+        success "SSH 连接成功 ✓"
+    else
+        echo -e "${RED}连接失败，原始错误：${NC}"
+        echo "$out"
+        echo ""
+        echo -e "${YELLOW}甲骨文云常见问题排查：${NC}"
+        echo "  1. 安全组/NSG 需放行 SSH 端口（默认22）"
+        echo "  2. Ubuntu 镜像用 ubuntu，Oracle Linux 镜像用 opc"
+        echo "  3. 密钥需与创建实例时上传的公钥对应"
+        echo "  4. 如果用密码方式，甲骨文默认禁用密码登录，需改用密钥"
+        echo "  5. .pem 文件需 chmod 600"
+        error "请检查后重试"
+    fi
+}
+
+# ── 统一执行远端命令 ───────────────────────────────────────
+_ssh_run() {
+    local cmd="$1"
+    if [[ "$AUTH_TYPE" == "password" ]]; then
+        sshpass -p "$ZZ_PASS" ssh $SSH_OPTS -p "$ZZ_SSH_PORT" "$ZZ_USER@$ZZ_HOST" "$cmd"
+    else
+        ssh $SSH_OPTS -p "$ZZ_SSH_PORT" "$ZZ_USER@$ZZ_HOST" "$cmd"
+    fi
+}
+
+# ── 统一向远端传入脚本（stdin） ────────────────────────────
+_ssh_pipe() {
+    if [[ "$AUTH_TYPE" == "password" ]]; then
+        sshpass -p "$ZZ_PASS" ssh $SSH_OPTS -p "$ZZ_SSH_PORT" "$ZZ_USER@$ZZ_HOST" bash -s
+    else
+        ssh $SSH_OPTS -p "$ZZ_SSH_PORT" "$ZZ_USER@$ZZ_HOST" bash -s
+    fi
+}
+
+# ── 获取下一个可用端口 ─────────────────────────────────────
+get_next_port() {
+    info "查询中转机端口分配情况..."
+
+    NODES_JSON=$(_ssh_run "cat /usr/local/etc/xray/nodes.json 2>/dev/null || echo '{\"nodes\":[]}'")
+    ZZ_META=$(_ssh_run    "cat /root/xray_zhongzhuan_info.txt 2>/dev/null || echo ''")
+
+    START_PORT=$(echo "$ZZ_META" | grep "^ZHONGZHUAN_START_PORT=" | cut -d= -f2)
+    MAX_NODES=$(echo  "$ZZ_META" | grep "^ZHONGZHUAN_MAX_NODES="  | cut -d= -f2)
+    START_PORT=${START_PORT:-10001}
+    MAX_NODES=${MAX_NODES:-20}
+
+    USED_PORTS=$(echo "$NODES_JSON" | jq -r '.nodes[].inbound_port' 2>/dev/null || echo "")
+
+    NEXT_PORT=""
+    for ((p=START_PORT; p<START_PORT+MAX_NODES; p++)); do
+        echo "$USED_PORTS" | grep -qx "$p" || { NEXT_PORT=$p; break; }
+    done
+
+    [[ -z "$NEXT_PORT" ]] && error "所有 $MAX_NODES 个端口已用满，请扩容中转机"
+
+    echo ""
+    [[ -n "$USED_PORTS" ]] && echo -e "  已用端口: ${YELLOW}$(echo $USED_PORTS | tr '\n' ' ')${NC}"
+    echo -e "  建议端口: ${CYAN}${NEXT_PORT}${NC}"
+    read -rp "确认 [回车=$NEXT_PORT，或输入其他端口]: " TMP
+    [[ -n "$TMP" ]] && NEXT_PORT="$TMP"
+    info "本次使用端口: $NEXT_PORT"
+}
+
+# ── 生成中转机入站 Reality 密钥对 ─────────────────────────
+gen_relay_keys() {
+    info "生成中转机入站 Reality 密钥对..."
+    if [[ -f "$XRAY_BIN" ]]; then
+        local kout
+        kout=$("$XRAY_BIN" x25519 2>/dev/null)
+        RELAY_PRIVKEY=$(echo "$kout" | grep "Private key:" | awk '{print $3}')
+        RELAY_PUBKEY=$(echo  "$kout" | grep "Public key:"  | awk '{print $3}')
+    else
+        warn "本机无 xray，使用 fallback 密钥（建议先运行 luodi.sh）"
+        RELAY_PRIVKEY="$LUODI_PUBKEY"
+        RELAY_PUBKEY="$LUODI_PUBKEY"
+    fi
+    RELAY_SHORTID=$(openssl rand -hex 8)
+    NODE_TAG="node-$(echo "$LUODI_IP" | tr '.' '-')-${NEXT_PORT}"
+}
+
+# ── 注入配置到中转机 ───────────────────────────────────────
+inject_config() {
+    info "将配置注入到中转机..."
+
+    # 通过管道传入 bash 脚本，脚本内用 python3 操作 JSON
+    # 所有变量通过 export 传递给远端 python3
+    _ssh_pipe <<REMOTE_SCRIPT
+export NODE_TAG="${NODE_TAG}"
+export NEXT_PORT="${NEXT_PORT}"
+export LUODI_IP="${LUODI_IP}"
+export LUODI_PORT="${LUODI_PORT}"
+export LUODI_UUID="${LUODI_UUID}"
+export LUODI_PUBKEY="${LUODI_PUBKEY}"
+export LUODI_SHORTID="${LUODI_SHORTID}"
+export LUODI_SNI="${LUODI_SNI}"
+export RELAY_PRIVKEY="${RELAY_PRIVKEY}"
+export RELAY_PUBKEY="${RELAY_PUBKEY}"
+export RELAY_SHORTID="${RELAY_SHORTID}"
+export ADDED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+
+set -e
+CFG="/usr/local/etc/xray/config.json"
+NDS="/usr/local/etc/xray/nodes.json"
+
+[[ ! -f "\$CFG" ]] && echo "[ERROR] 中转机配置文件不存在: \$CFG" && exit 1
+
+# 备份
+cp "\$CFG" "\${CFG}.bak.\$(date +%s)"
+
+python3 - <<'PYEOF'
+import json, os, sys
+
+cfg_path   = "/usr/local/etc/xray/config.json"
+nodes_path = "/usr/local/etc/xray/nodes.json"
+e = os.environ
+
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+except Exception as ex:
+    print(f"[ERROR] 无法解析配置文件: {ex}")
+    sys.exit(1)
+
+tag          = e["NODE_TAG"]
+in_port      = int(e["NEXT_PORT"])
+luodi_ip     = e["LUODI_IP"]
+luodi_port   = int(e["LUODI_PORT"])
+uuid         = e["LUODI_UUID"]
+luodi_pubkey = e["LUODI_PUBKEY"]
+luodi_sid    = e["LUODI_SHORTID"]
+sni          = e["LUODI_SNI"]
+r_privkey    = e["RELAY_PRIVKEY"]
+r_pubkey     = e["RELAY_PUBKEY"]
+r_sid        = e["RELAY_SHORTID"]
+added_at     = e["ADDED_AT"]
+
+# 检查端口是否已存在
+for ib in cfg.get("inbounds", []):
+    if ib.get("port") == in_port:
+        print(f"[ERROR] 端口 {in_port} 已被占用，请换一个端口")
+        sys.exit(1)
+
+# 入站：用户 → 中转机（Reality 在中转机终结）
+new_in = {
+    "tag": f"{tag}-in",
+    "listen": "0.0.0.0",
+    "port": in_port,
+    "protocol": "vless",
+    "settings": {
+        "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+            "show": False,
+            "dest": f"{sni}:443",
+            "xver": 0,
+            "serverNames": [sni],
+            "privateKey": r_privkey,
+            "shortIds": [r_sid]
+        }
+    },
+    "sniffing": {"enabled": True, "destOverride": ["http","tls","quic"]}
+}
+
+# 出站：中转机 → 落地机（Reality 连落地机）
+new_out = {
+    "tag": f"{tag}-out",
+    "protocol": "vless",
+    "settings": {
+        "vnext": [{
+            "address": luodi_ip,
+            "port": luodi_port,
+            "users": [{"id": uuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
+        }]
+    },
+    "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+            "fingerprint": "chrome",
+            "serverName": sni,
+            "publicKey": luodi_pubkey,
+            "shortId": luodi_sid
+        }
+    }
+}
+
+# 路由：该入站 → 该出站（插最前确保优先命中）
+new_rule = {
+    "type": "field",
+    "inboundTag": [f"{tag}-in"],
+    "outboundTag": f"{tag}-out"
+}
+
+cfg.setdefault("inbounds",  []).append(new_in)
+cfg.setdefault("outbounds", []).append(new_out)
+cfg.setdefault("routing", {}).setdefault("rules", []).insert(0, new_rule)
+
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+# 更新节点记录
+try:
+    with open(nodes_path) as f:
+        nodes = json.load(f)
+except Exception:
+    nodes = {"nodes": []}
+
+nodes["nodes"].append({
+    "tag":           tag,
+    "luodi_ip":      luodi_ip,
+    "luodi_port":    luodi_port,
+    "inbound_port":  in_port,
+    "relay_pubkey":  r_pubkey,
+    "relay_shortid": r_sid,
+    "uuid":          uuid,
+    "added_at":      added_at
+})
+
+with open(nodes_path, "w") as f:
+    json.dump(nodes, f, indent=2, ensure_ascii=False)
+
+print("[OK] 配置注入成功")
+PYEOF
+REMOTE_SCRIPT
+
+    success "配置注入完成"
+
+    # 重启中转机 Xray
+    info "重启中转机 Xray 服务..."
+    local st
+    st=$(_ssh_run "systemctl restart xray 2>&1; sleep 2; systemctl is-active xray 2>&1" || echo "unknown")
+    if echo "$st" | grep -q "^active"; then
+        success "中转机 Xray 重启成功 ✓"
+    else
+        warn "Xray 状态异常，请登录中转机检查："
+        warn "  journalctl -u xray -n 30 --no-pager"
+        warn "  xray -test -c /usr/local/etc/xray/config.json"
+    fi
+}
+
+# ── 手动模式 ───────────────────────────────────────────────
+manual_mode() {
+    echo ""
+    echo -e "${YELLOW}══════════ 手动对接模式 ══════════════════════════════${NC}"
+    read -rp "中转机上使用哪个端口？(例如 10001): " NEXT_PORT
+    [[ -z "$NEXT_PORT" ]] && error "端口不能为空"
+
+    # 手动模式下在本机生成密钥
+    gen_relay_keys
+
+    echo ""
+    echo -e "${CYAN}══ 1. 追加到中转机 inbounds 数组 ══════════════════════${NC}"
+    python3 - <<PYEOF
+import json
+d = {
+    "tag": "${NODE_TAG}-in",
+    "listen": "0.0.0.0",
+    "port": int("${NEXT_PORT}"),
+    "protocol": "vless",
+    "settings": {"clients":[{"id":"${LUODI_UUID}","flow":"xtls-rprx-vision"}],"decryption":"none"},
+    "streamSettings": {
+        "network":"tcp","security":"reality",
+        "realitySettings":{
+            "show":False,"dest":"${LUODI_SNI}:443","xver":0,
+            "serverNames":["${LUODI_SNI}"],
+            "privateKey":"${RELAY_PRIVKEY}",
+            "shortIds":["${RELAY_SHORTID}"]
+        }
+    },
+    "sniffing":{"enabled":True,"destOverride":["http","tls","quic"]}
+}
+print(json.dumps(d,indent=2,ensure_ascii=False))
+PYEOF
+
+    echo ""
+    echo -e "${CYAN}══ 2. 追加到中转机 outbounds 数组 ═════════════════════${NC}"
+    python3 - <<PYEOF
+import json
+d = {
+    "tag": "${NODE_TAG}-out",
+    "protocol":"vless",
+    "settings":{"vnext":[{"address":"${LUODI_IP}","port":int("${LUODI_PORT}"),
+        "users":[{"id":"${LUODI_UUID}","flow":"xtls-rprx-vision","encryption":"none"}]}]},
+    "streamSettings":{
+        "network":"tcp","security":"reality",
+        "realitySettings":{"fingerprint":"chrome","serverName":"${LUODI_SNI}",
+            "publicKey":"${LUODI_PUBKEY}","shortId":"${LUODI_SHORTID}"}
+    }
+}
+print(json.dumps(d,indent=2,ensure_ascii=False))
+PYEOF
+
+    echo ""
+    echo -e "${CYAN}══ 3. 插入到 routing.rules 数组最前面 ══════════════════${NC}"
+    echo "{\"type\":\"field\",\"inboundTag\":[\"${NODE_TAG}-in\"],\"outboundTag\":\"${NODE_TAG}-out\"}"
+
+    echo ""
+    echo -e "${YELLOW}4. 中转机执行: systemctl restart xray${NC}"
+    echo ""
+    echo -e "${YELLOW}客户端参数（连中转机）：${NC}"
+    echo "  地址   : <中转机IP>"
+    echo "  端口   : $NEXT_PORT"
+    echo "  UUID   : $LUODI_UUID"
+    echo "  Flow   : xtls-rprx-vision"
+    echo "  pbk    : $RELAY_PUBKEY   ← 中转机入站公钥"
+    echo "  sid    : $RELAY_SHORTID"
+    echo "  sni    : $LUODI_SNI"
+    echo "  fp     : chrome"
+}
+
+# ── 输出客户端节点链接 ─────────────────────────────────────
+gen_client_link() {
+    local zz="${ZZ_HOST:-<中转机IP>}"
+    local link="vless://${LUODI_UUID}@${zz}:${NEXT_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${LUODI_SNI}&fp=chrome&pbk=${RELAY_PUBKEY}&sid=${RELAY_SHORTID}&type=tcp&headerType=none#中转${zz}:${NEXT_PORT}→落地${LUODI_IP}"
+
+    echo ""
+    echo -e "${CYAN}══════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  对接完成！客户端节点链接${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "$link"
+    echo ""
+    echo -e "${YELLOW}流量路径：用户 → ${zz}:${NEXT_PORT}（中转）→ ${LUODI_IP}:${LUODI_PORT}（落地）→ 互联网${NC}"
+    echo ""
+
+    {
+        echo "================================================================"
+        echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "中转: ${zz}:${NEXT_PORT}   落地: ${LUODI_IP}:${LUODI_PORT}"
+        echo "链接: $link"
+    } >> /root/duijie_records.txt
+
+    success "记录已追加到 /root/duijie_records.txt"
+}
+
+# ── 主流程 ─────────────────────────────────────────────────
+main() {
     echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════════╗"
-    echo "║           落地机代理节点 ↔ 中转机 一键对接工具                  ║"
-    echo "║                       v1.04                                   ║"
-    echo "╚════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
-
-print_section() {
+    echo "  ██████╗ ██╗   ██╗██╗     ██╗██╗███████╗"
+    echo "  ██╔══██╗██║   ██║██║     ██║██║██╔════╝"
+    echo "  ██║  ██║██║   ██║██║     ██║██║█████╗  "
+    echo "  ██║  ██║██║   ██║██║██   ██║██║██╔══╝  "
+    echo "  ██████╔╝╚██████╔╝██║╚█████╔╝██║███████╗"
+    echo "  ╚═════╝  ╚═════╝ ╚═╝ ╚════╝ ╚═╝╚══════╝"
+    echo -e "  落地机 ↔ 中转机 对接脚本 v2.1${NC}"
     echo ""
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${PURPLE}${1}${NC}"
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
 
-print_info()    { echo -e "${BLUE}[i]${NC} $1"; }
-print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-print_error()   { echo -e "${RED}[✗]${NC} $1"; }
-print_warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
-print_input()   { echo -e "${CYAN}[?]${NC} $1"; }
+    check_deps
+    read_luodi_info
+    get_zhongzhuan_ssh
 
-pause_input() {
-    echo ""
-    read -rp "$(echo -e "${CYAN}")[按Enter继续...]$(echo -e "${NC}")"
-    echo ""
-}
-
-# ============================================================================
-# 主程序
-# ============================================================================
-
-print_title
-
-if [[ "$EUID" -ne 0 ]]; then
-    print_error "必须使用 root 权限运行此脚本！"
-    exit 1
-fi
-
-# ============================================================================
-print_section "步骤 1/5: 读取本机信息"
-# ============================================================================
-
-# ---- 读取 luodi.sh 保存的摘要 ----
-# 兼容新版(peer-summary.txt)和旧版(summary.txt)
-SUMMARY_FILE=""
-for f in \
-    "/opt/relay-wg/config/peer-summary.txt" \
-    "/opt/relay-wg/config/summary.txt"; do
-    if [[ -f "$f" ]]; then
-        SUMMARY_FILE="$f"
-        break
-    fi
-done
-
-if [[ -z "$SUMMARY_FILE" ]]; then
-    print_error "未找到落地机摘要文件"
-    print_error "查找路径："
-    print_error "  /opt/relay-wg/config/peer-summary.txt"
-    print_error "  /opt/relay-wg/config/summary.txt"
-    print_error "请先运行 luodi.sh 完成 WireGuard 部署"
-    exit 1
-fi
-
-print_info "读取摘要: $SUMMARY_FILE"
-
-# 提取落地机公网IP（【本落地机】段落下的公网IP）
-LANDING_IP=$(awk '/本落地机/{found=1} /中转机信息/{found=0} found && /公网 IP/{match($0,/([0-9]{1,3}\.){3}[0-9]{1,3}/); if(RLENGTH>0){print substr($0,RSTART,RLENGTH); exit}}' "$SUMMARY_FILE")
-
-# 提取中转机IP（【中转机信息】段落下的公网IP）
-RELAY_IP=$(awk '/中转机信息/{found=1} found && /公网 IP/{match($0,/([0-9]{1,3}\.){3}[0-9]{1,3}/); if(RLENGTH>0){print substr($0,RSTART,RLENGTH); exit}}' "$SUMMARY_FILE")
-
-# 兼容新版摘要格式（peer-summary.txt）
-if [[ -z "$RELAY_IP" ]]; then
-    RELAY_IP=$(grep '中转机公网IP' "$SUMMARY_FILE" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-fi
-
-# 兼容两种格式提取本机WG IP
-WG_LOCAL_IP=$(grep -E 'WireGuard地址|WireGuard IP' "$SUMMARY_FILE" \
-    | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-
-# 如果摘要里没有落地机公网IP，实时获取
-if [[ -z "$LANDING_IP" ]]; then
-    print_info "正在获取本机公网IP..."
-    LANDING_IP=$(curl -s --max-time 5 https://api.ip.sb/ip 2>/dev/null \
-        || curl -s --max-time 5 https://ifconfig.me 2>/dev/null \
-        || echo "")
-fi
-
-if [[ -z "$RELAY_IP" ]]; then
-    print_error "无法从摘要文件读取中转机IP，请检查 $SUMMARY_FILE"
-    exit 1
-fi
-
-if [[ -z "$WG_LOCAL_IP" ]]; then
-    # 尝试从 wg0 接口直接获取
-    WG_LOCAL_IP=$(ip addr show wg0 2>/dev/null | grep -oE '10\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-fi
-
-print_success "中转机IP:   $RELAY_IP"
-print_success "本机WG IP:  ${WG_LOCAL_IP:-未知}"
-print_success "本机公网IP: ${LANDING_IP:-未知}"
-
-# ---- 验证 WireGuard 隧道 ----
-echo ""
-print_info "验证 WireGuard 隧道..."
-if ! wg show wg0 &>/dev/null; then
-    print_error "WireGuard wg0 接口未运行！"
-    print_error "请先运行: systemctl start wg-quick@wg0"
-    exit 1
-fi
-
-if ! ping -c 1 -W 3 10.0.0.1 &>/dev/null; then
-    print_error "无法 ping 通中转机内网 10.0.0.1，隧道可能断开"
-    print_error "请检查: wg show"
-    exit 1
-fi
-print_success "WireGuard 隧道正常（延迟: $(ping -c 1 -W 3 10.0.0.1 2>/dev/null | grep -oE 'time=[0-9.]+' | head -1)ms）"
-
-pause_input
-
-# ============================================================================
-print_section "步骤 2/5: 检测代理节点"
-# ============================================================================
-
-# ---- 检测 v2ray-agent 类型 ----
-AGENT_TYPE=""
-CONF_DIR=""
-
-if [[ -d /etc/v2ray-agent/xray/conf ]]; then
-    AGENT_TYPE="xray"
-    CONF_DIR="/etc/v2ray-agent/xray/conf"
-    print_success "检测到 Xray (v2ray-agent)"
-elif [[ -d /etc/v2ray-agent/sing-box/conf ]]; then
-    AGENT_TYPE="singbox"
-    CONF_DIR="/etc/v2ray-agent/sing-box/conf"
-    print_success "检测到 Sing-box (v2ray-agent)"
-else
-    print_error "未检测到 v2ray-agent！请先安装代理节点"
-    print_info "安装地址: https://github.com/mack-a/v2ray-agent"
-    exit 1
-fi
-
-# ---- 检测代理端口和协议 ----
-echo ""
-print_info "扫描代理节点配置..."
-
-declare -a NODE_PORTS=()
-declare -a NODE_PROTOS=()
-declare -a NODE_LINKS=()
-
-if [[ "$AGENT_TYPE" == "xray" ]]; then
-    # 扫描所有 inbound 配置文件
-    for conf_file in "$CONF_DIR"/*inbound*.json; do
-        [[ -f "$conf_file" ]] || continue
-
-        # 提取端口
-        while IFS= read -r line; do
-            port=$(echo "$line" | grep -oE '"port"\s*:\s*[0-9]+' | grep -oE '[0-9]+' | head -1)
-            [[ -z "$port" ]] && continue
-            [[ "$port" -lt 1 || "$port" -gt 65535 ]] && continue
-
-            # 判断协议
-            proto="unknown"
-            fname=$(basename "$conf_file")
-            if [[ "$fname" == *"VLESS"* || "$fname" == *"vless"* ]]; then
-                if [[ "$fname" == *"reality"* || "$fname" == *"Reality"* ]]; then
-                    proto="vless-reality"
-                elif [[ "$fname" == *"vision"* ]]; then
-                    proto="vless-vision"
-                else
-                    proto="vless"
-                fi
-            elif [[ "$fname" == *"VMess"* || "$fname" == *"vmess"* ]]; then
-                proto="vmess"
-            elif [[ "$fname" == *"trojan"* || "$fname" == *"Trojan"* ]]; then
-                proto="trojan"
-            elif [[ "$fname" == *"hysteria"* || "$fname" == *"Hysteria"* ]]; then
-                proto="hysteria2"
-            fi
-
-            # 去重
-            already=false
-            for p in "${NODE_PORTS[@]:-}"; do
-                [[ "$p" == "$port" ]] && already=true && break
-            done
-            $already && continue
-
-            NODE_PORTS+=("$port")
-            NODE_PROTOS+=("$proto")
-        done < <(grep -oE '"port"\s*:\s*[0-9]+' "$conf_file" 2>/dev/null)
-    done
-
-    # 也扫描实际监听端口（补充配置文件没覆盖的）
-    while read -r port; do
-        already=false
-        for p in "${NODE_PORTS[@]:-}"; do
-            [[ "$p" == "$port" ]] && already=true && break
-        done
-        $already && continue
-        # 排除 SSH 和系统端口
-        [[ "$port" -le 1024 ]] && continue
-        NODE_PORTS+=("$port")
-        NODE_PROTOS+=("unknown")
-    done < <(ss -tulnp 2>/dev/null \
-        | grep -E 'xray' \
-        | grep -oE ':[0-9]+' \
-        | grep -oE '[0-9]+' \
-        | sort -un)
-fi
-
-if [[ ${#NODE_PORTS[@]} -eq 0 ]]; then
-    print_warn "未自动检测到代理端口，请手动输入"
-    while true; do
-        read -rp "$(echo -e "${CYAN}")代理端口${NC}: " manual_port
-        if [[ "$manual_port" =~ ^[0-9]+$ ]] && (( manual_port >= 1 && manual_port <= 65535 )); then
-            NODE_PORTS+=("$manual_port")
-            NODE_PROTOS+=("unknown")
-            break
-        fi
-        print_error "端口格式错误，请重新输入"
-    done
-fi
-
-echo ""
-print_success "检测到以下代理节点："
-echo ""
-for (( i=0; i<${#NODE_PORTS[@]}; i++ )); do
-    echo -e "  ${CYAN}[$((i+1))]${NC} 端口: ${GREEN}${NODE_PORTS[$i]}${NC}  协议: ${NODE_PROTOS[$i]}"
-done
-echo ""
-
-# ---- 如果有多个节点，让用户选择要对接哪些 ----
-declare -a SELECTED_PORTS=()
-declare -a SELECTED_PROTOS=()
-
-if [[ ${#NODE_PORTS[@]} -eq 1 ]]; then
-    SELECTED_PORTS=("${NODE_PORTS[0]}")
-    SELECTED_PROTOS=("${NODE_PROTOS[0]}")
-    print_info "只有一个节点，自动选择端口 ${NODE_PORTS[0]}"
-else
-    print_input "请选择要对接到中转机的节点编号（多个用空格分隔，直接回车选择全部）"
-    read -rp "$(echo -e "${CYAN}")选择${NC}: " selection
-    if [[ -z "$selection" ]]; then
-        SELECTED_PORTS=("${NODE_PORTS[@]}")
-        SELECTED_PROTOS=("${NODE_PROTOS[@]}")
-        print_info "已选择全部 ${#NODE_PORTS[@]} 个节点"
+    if [[ "$MANUAL_MODE" == "true" ]]; then
+        manual_mode
     else
-        for idx in $selection; do
-            if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#NODE_PORTS[@]} )); then
-                SELECTED_PORTS+=("${NODE_PORTS[$((idx-1))]}")
-                SELECTED_PROTOS+=("${NODE_PROTOS[$((idx-1))]}")
-            fi
-        done
-        print_info "已选择 ${#SELECTED_PORTS[@]} 个节点"
+        get_next_port
+        gen_relay_keys
+        inject_config
+        gen_client_link
     fi
-fi
-
-pause_input
-
-# ============================================================================
-print_section "步骤 3/5: SSH 到中转机添加转发规则"
-# ============================================================================
-
-print_info "将通过 WireGuard 隧道（10.0.0.1）SSH 到中转机"
-print_info "添加 DNAT + SNAT + INPUT 规则（SNAT解决非对称路由）"
-echo ""
-
-# ---- SSH 基本参数 ----
-read -rp "$(echo -e "${CYAN}")SSH端口${NC} [默认: 22]: " RELAY_SSH_PORT
-RELAY_SSH_PORT=${RELAY_SSH_PORT:-22}
-read -rp "$(echo -e "${CYAN}")用户名${NC} [默认: root]: " RELAY_SSH_USER
-RELAY_SSH_USER=${RELAY_SSH_USER:-root}
-
-# ---- 认证方式 ----
-echo ""
-print_info "选择 SSH 认证方式："
-echo -e "  ${CYAN}[1]${NC} 密码登录"
-echo -e "  ${CYAN}[2]${NC} 密钥登录（本机 ~/.ssh/id_rsa 或指定路径）"
-echo -e "  ${CYAN}[3]${NC} 跳过自动配置（显示手动命令）"
-read -rp "$(echo -e "${CYAN}")选择${NC} [默认: 1]: " auth_choice
-auth_choice=${auth_choice:-1}
-
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $RELAY_SSH_PORT"
-SSH_CMD=""
-RELAY_SSH_PASS=""
-KEY_FILE=""
-
-case "$auth_choice" in
-    1)
-        read -rsp "$(echo -e "${CYAN}")SSH密码${NC}: " RELAY_SSH_PASS
-        echo ""
-        if ! command -v sshpass &>/dev/null; then
-            print_info "安装 sshpass..."
-            apt-get install -y -qq sshpass 2>/dev/null || true
-        fi
-        if command -v sshpass &>/dev/null && [[ -n "$RELAY_SSH_PASS" ]]; then
-            SSH_CMD="sshpass -p '$RELAY_SSH_PASS' ssh $SSH_OPTS"
-        else
-            print_warn "sshpass 不可用或密码为空，降级为手动模式"
-            auth_choice=3
-        fi
-        ;;
-    2)
-        read -rp "$(echo -e "${CYAN}")密钥文件路径${NC} [默认: ~/.ssh/id_rsa]: " KEY_FILE
-        KEY_FILE=${KEY_FILE:-~/.ssh/id_rsa}
-        KEY_FILE="${KEY_FILE/#\~/$HOME}"
-        if [[ ! -f "$KEY_FILE" ]]; then
-            print_warn "密钥文件不存在: $KEY_FILE，降级为手动模式"
-            auth_choice=3
-        else
-            SSH_CMD="ssh $SSH_OPTS -i '$KEY_FILE'"
-        fi
-        ;;
-    3)
-        print_info "已选择手动模式"
-        ;;
-    *)
-        auth_choice=3
-        ;;
-esac
-
-# ---- 构建远程命令（DNAT + SNAT + INPUT行号插入）----
-build_relay_cmds() {
-    printf 'set -e\n'
-    printf 'echo 1 > /proc/sys/net/ipv4/ip_forward\n'
-    for port in "${SELECTED_PORTS[@]}"; do
-        printf 'echo "[+] 配置端口 %s..."\n' "$port"
-        # 清除旧规则
-        printf 'iptables -t nat -D PREROUTING -p tcp --dport %s -j DNAT --to-destination %s:%s 2>/dev/null || true\n' "$port" "$LANDING_IP" "$port"
-        printf 'iptables -t nat -D PREROUTING -p udp --dport %s -j DNAT --to-destination %s:%s 2>/dev/null || true\n' "$port" "$LANDING_IP" "$port"
-        printf 'iptables -t nat -D POSTROUTING -p tcp -d %s --dport %s -j SNAT --to-source %s 2>/dev/null || true\n' "$LANDING_IP" "$port" "$RELAY_IP"
-        printf 'iptables -t nat -D POSTROUTING -p udp -d %s --dport %s -j SNAT --to-source %s 2>/dev/null || true\n' "$LANDING_IP" "$port" "$RELAY_IP"
-        printf 'iptables -D FORWARD -p tcp -d %s --dport %s -j ACCEPT 2>/dev/null || true\n' "$LANDING_IP" "$port"
-        printf 'iptables -D FORWARD -p udp -d %s --dport %s -j ACCEPT 2>/dev/null || true\n' "$LANDING_IP" "$port"
-        # 添加 DNAT
-        printf 'iptables -t nat -A PREROUTING -p tcp --dport %s -j DNAT --to-destination %s:%s\n' "$port" "$LANDING_IP" "$port"
-        printf 'iptables -t nat -A PREROUTING -p udp --dport %s -j DNAT --to-destination %s:%s\n' "$port" "$LANDING_IP" "$port"
-        # 添加 SNAT（解决非对称路由）
-        printf 'iptables -t nat -A POSTROUTING -p tcp -d %s --dport %s -j SNAT --to-source %s\n' "$LANDING_IP" "$port" "$RELAY_IP"
-        printf 'iptables -t nat -A POSTROUTING -p udp -d %s --dport %s -j SNAT --to-source %s\n' "$LANDING_IP" "$port" "$RELAY_IP"
-        # FORWARD
-        printf 'iptables -A FORWARD -p tcp -d %s --dport %s -j ACCEPT\n' "$LANDING_IP" "$port"
-        printf 'iptables -A FORWARD -p udp -d %s --dport %s -j ACCEPT\n' "$LANDING_IP" "$port"
-        # INPUT — 插到全局 DROP 之前
-        printf 'for _proto in tcp udp; do\n'
-        printf '  iptables -D INPUT -p $_proto --dport %s -j ACCEPT 2>/dev/null || true\n' "$port"
-        printf '  _drop=$(iptables -L INPUT --line-numbers -n 2>/dev/null | awk '"'"'/^\s*[0-9].*DROP/{print $1; exit}'"'"')\n'
-        printf '  if [[ -n "$_drop" ]]; then\n'
-        printf '    iptables -I INPUT "$_drop" -p $_proto --dport %s -j ACCEPT\n' "$port"
-        printf '  else\n'
-        printf '    iptables -A INPUT -p $_proto --dport %s -j ACCEPT\n' "$port"
-        printf '  fi\n'
-        printf 'done\n'
-        printf 'echo "[✓] 端口 %s 完成"\n' "$port"
-    done
-    printf 'mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4\n'
-    printf 'echo "[✓] 规则已保存"\n'
 }
 
-# ---- 显示手动命令 ----
-show_manual_cmds() {
-    print_warn "请手动在中转机上执行以下命令："
-    echo ""
-    for port in "${SELECTED_PORTS[@]}"; do
-        echo -e "${CYAN}# 端口 $port${NC}"
-        echo "iptables -t nat -A PREROUTING -p tcp --dport $port -j DNAT --to-destination ${LANDING_IP}:${port}"
-        echo "iptables -t nat -A PREROUTING -p udp --dport $port -j DNAT --to-destination ${LANDING_IP}:${port}"
-        echo "iptables -t nat -A POSTROUTING -p tcp -d ${LANDING_IP} --dport $port -j SNAT --to-source ${RELAY_IP}"
-        echo "iptables -t nat -A POSTROUTING -p udp -d ${LANDING_IP} --dport $port -j SNAT --to-source ${RELAY_IP}"
-        echo "iptables -A FORWARD -p tcp -d ${LANDING_IP} --dport $port -j ACCEPT"
-        echo "iptables -A FORWARD -p udp -d ${LANDING_IP} --dport $port -j ACCEPT"
-        echo 'DROP_LINE=$(iptables -L INPUT --line-numbers -n | awk '"'"'/DROP/{print $1; exit}'"'"')'
-        echo "iptables -I \"\$DROP_LINE\" -p tcp --dport $port -j ACCEPT"
-        echo "iptables -I \"\$DROP_LINE\" -p udp --dport $port -j ACCEPT"
-        echo ""
-    done
-    echo "iptables-save > /etc/iptables/rules.v4"
-    echo ""
-}
-
-# ---- 执行 SSH ----
-if [[ "$auth_choice" == "3" ]]; then
-    show_manual_cmds
-else
-    RELAY_CMDS=$(build_relay_cmds)
-    print_info "正在连接中转机 10.0.0.1:${RELAY_SSH_PORT}..."
-    SSH_RESULT=0
-    if [[ "$auth_choice" == "1" ]]; then
-        sshpass -p "$RELAY_SSH_PASS" ssh $SSH_OPTS "${RELAY_SSH_USER}@10.0.0.1" "bash -s" <<< "$RELAY_CMDS" 2>&1 || SSH_RESULT=$?
-    else
-        ssh $SSH_OPTS -i "$KEY_FILE" "${RELAY_SSH_USER}@10.0.0.1" "bash -s" <<< "$RELAY_CMDS" 2>&1 || SSH_RESULT=$?
-    fi
-    if [[ $SSH_RESULT -eq 0 ]]; then
-        print_success "中转机 DNAT+SNAT+INPUT 规则已配置"
-    else
-        print_error "SSH 失败（退出码: $SSH_RESULT）"
-        show_manual_cmds
-    fi
-fi
-
-pause_input
-
-# ============================================================================
-print_section "步骤 4/5: 生成节点链接"
-# ============================================================================
-
-print_info "读取 Xray 节点配置，生成中转机入口链接..."
-echo ""
-
-declare -a FINAL_LINKS=()
-
-if [[ "$AGENT_TYPE" == "xray" ]]; then
-    for (( i=0; i<${#SELECTED_PORTS[@]}; i++ )); do
-        port="${SELECTED_PORTS[$i]}"
-        proto="${SELECTED_PROTOS[$i]}"
-
-        # 找对应的 inbound 配置文件
-        conf_file=""
-        for f in "$CONF_DIR"/*inbound*.json; do
-            [[ -f "$f" ]] || continue
-            if grep -q "\"port\".*:.*$port\b" "$f" 2>/dev/null || \
-               grep -q "\"port\": $port" "$f" 2>/dev/null; then
-                conf_file="$f"
-                break
-            fi
-        done
-
-        if [[ -z "$conf_file" ]]; then
-            print_warn "端口 $port 未找到对应配置文件，跳过生成链接"
-            continue
-        fi
-
-        # 提取节点参数（兼容 v2ray-agent 的 Reality 配置格式）
-        UUID=$(grep -oE '"id"\s*:\s*"[^"]+"' "$conf_file" 2>/dev/null \
-            | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
-
-        # SNI: 优先取 serverNames 数组第一个，兜底取 serverName
-        SNI=$(python3 -c "
-import json, sys
-try:
-    data = json.load(open('$conf_file'))
-    for inb in data.get('inbounds', []):
-        rs = inb.get('streamSettings',{}).get('realitySettings',{})
-        names = rs.get('serverNames', [])
-        if names:
-            print(names[0]); sys.exit()
-        sn = rs.get('serverName','')
-        if sn:
-            print(sn); sys.exit()
-except: pass
-" 2>/dev/null || \
-            grep -oE '"serverNames"\s*:\s*\[[^]]+\]' "$conf_file" 2>/dev/null \
-            | grep -oE '"[a-zA-Z0-9._-]+"' | grep -v '^""$' | head -1 | tr -d '"')
-
-        # 公钥
-        PBK=$(python3 -c "
-import json, sys
-try:
-    data = json.load(open('$conf_file'))
-    for inb in data.get('inbounds', []):
-        pk = inb.get('streamSettings',{}).get('realitySettings',{}).get('publicKey','')
-        if pk: print(pk); sys.exit()
-except: pass
-" 2>/dev/null || \
-            grep -oE '"publicKey"\s*:\s*"[^"]+"' "$conf_file" 2>/dev/null \
-            | grep -oE ':\s*"[^"]+"' | tr -d ': "' | head -1)
-
-        # shortId: 取非空的第一个
-        SID=$(python3 -c "
-import json, sys
-try:
-    data = json.load(open('$conf_file'))
-    for inb in data.get('inbounds', []):
-        ids = inb.get('streamSettings',{}).get('realitySettings',{}).get('shortIds', [])
-        for sid in ids:
-            if sid: print(sid); sys.exit()
-except: pass
-" 2>/dev/null || \
-            grep -oE '"shortIds"\s*:\s*\[[^]]+\]' "$conf_file" 2>/dev/null \
-            | grep -oE '"[a-f0-9]+"' | head -1 | tr -d '"')
-
-        # fingerprint（v2ray-agent 默认 chrome）
-        FP=$(grep -oE '"fingerprint"\s*:\s*"[^"]+"' "$conf_file" 2>/dev/null \
-            | grep -oE ':\s*"[^"]+"' | tr -d ': "' | head -1)
-        FP=${FP:-chrome}
-
-        # flow
-        FLOW=$(grep -oE '"flow"\s*:\s*"[^"]+"' "$conf_file" 2>/dev/null \
-            | grep -oE ':\s*"[^"]+"' | tr -d ': "' | head -1)
-
-        # network（dokodemo-door 转发结构，实际是 tcp）
-        NETWORK="tcp"
-
-        if [[ -z "$UUID" ]]; then
-            print_warn "端口 $port 无法提取 UUID，跳过"
-            continue
-        fi
-
-        # 生成链接（入口IP改为中转机）
-        link=""
-        tag="${proto}-${port}-via-CN2GIA"
-
-        if [[ "$proto" == "vless-reality" || "$proto" == "vless-vision" || "$proto" == *"vless"* ]]; then
-            params="encryption=none"
-            [[ -n "$FLOW" ]] && params+="&flow=${FLOW}"
-            if [[ -n "$PBK" ]]; then
-                params+="&security=reality&type=${NETWORK}"
-                [[ -n "$SNI" ]] && params+="&sni=${SNI}"
-                [[ -n "$FP"  ]] && params+="&fp=${FP}"
-                params+="&pbk=${PBK}"
-                [[ -n "$SID" ]] && params+="&sid=${SID}"
-            else
-                params+="&security=tls&type=${NETWORK}"
-                [[ -n "$SNI" ]] && params+="&sni=${SNI}"
-            fi
-            link="vless://${UUID}@${RELAY_IP}:${port}?${params}#${tag}"
-
-        elif [[ "$proto" == "vmess" ]]; then
-            # VMess JSON 格式
-            link=$(python3 -c "
-import json, base64
-config = {
-    'v':'2','ps':'${tag}','add':'${RELAY_IP}','port':'${port}',
-    'id':'${UUID}','aid':'0','net':'${NETWORK}','type':'none',
-    'host':'${SNI:-}','path':'','tls':'tls'
-}
-print('vmess://' + base64.b64encode(json.dumps(config).encode()).decode())
-" 2>/dev/null || echo "")
-
-        elif [[ "$proto" == "trojan" ]]; then
-            link="trojan://${UUID}@${RELAY_IP}:${port}?security=tls&sni=${SNI:-}&type=${NETWORK}#${tag}"
-        fi
-
-        if [[ -n "$link" ]]; then
-            FINAL_LINKS+=("$link")
-            print_success "端口 $port 链接已生成"
-        fi
-    done
-fi
-
-pause_input
-
-# ============================================================================
-print_section "步骤 5/5: 完成总结"
-# ============================================================================
-
-# ---- 保存节点链接 ----
-NODES_FILE="/opt/relay-wg/config/nodes.txt"
-cat > "$NODES_FILE" <<EOF
-========================================
-  对接节点链接
-  生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-  入口: 中转机 $RELAY_IP (CN2GIA)
-  出站: 落地机 ${LANDING_IP:-未知}
-========================================
-
-EOF
-
-for (( i=0; i<${#SELECTED_PORTS[@]}; i++ )); do
-    port="${SELECTED_PORTS[$i]}"
-    proto="${SELECTED_PROTOS[$i]}"
-    echo "【端口 $port | $proto】" >> "$NODES_FILE"
-    # 找对应链接
-    for link in "${FINAL_LINKS[@]:-}"; do
-        if [[ "$link" == *":${port}?"* || "$link" == *"port\":\"${port}\""* ]]; then
-            echo "$link" >> "$NODES_FILE"
-        fi
-    done
-    echo "" >> "$NODES_FILE"
-done
-
-chmod 600 "$NODES_FILE"
-print_success "节点链接已保存: $NODES_FILE"
-
-# ---- 更新 relay-info 命令，加入节点信息 ----
-cat > /usr/local/bin/relay-info << 'CMEOF'
-#!/bin/bash
-CYAN='\033[0;36m' YELLOW='\033[1;33m' GREEN='\033[0;32m' NC='\033[0m'
-
-echo -e "${CYAN}"
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║              落地机信息速查                              ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-
-# 基础信息
-SUMMARY=/opt/relay-wg/config/peer-summary.txt
-[[ -f "$SUMMARY" ]] && cat "$SUMMARY"
-
-# 节点链接
-NODES=/opt/relay-wg/config/nodes.txt
-if [[ -f "$NODES" ]]; then
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━ 节点链接 ━━━━━━━━━━━━━━━━━${NC}"
-    cat "$NODES"
-fi
-
-echo ""
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━ 实时状态 ━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}▸ WireGuard:${NC}"
-wg show 2>/dev/null || echo "  (未运行)"
-
-echo ""
-echo -e "${GREEN}▸ 本机公网 IP:${NC}"
-curl -s --max-time 5 https://api.ip.sb/ip 2>/dev/null || echo "  (获取失败)"
-
-echo ""
-echo -e "${GREEN}▸ 隧道连通性 (ping 10.0.0.1):${NC}"
-ping -c 3 -W 2 10.0.0.1 2>/dev/null || echo "  (不通，检查WireGuard)"
-CMEOF
-chmod +x /usr/local/bin/relay-info
-
-# ---- 最终展示 ----
-echo ""
-echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║               ★ 对接完成！节点信息如下 ★                      ║${NC}"
-echo -e "${CYAN}╚════════════════════════════════════════════════════════════════╝${NC}"
-echo ""
-
-echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│  【流量路径】                                               │${NC}"
-echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-echo -e "  用户连接   → ${GREEN}${RELAY_IP}${NC} (中转机 CN2GIA 入口)"
-echo -e "  隧道传输   → ${GREEN}WireGuard 加密隧道${NC}"
-echo -e "  流量出站   → ${GREEN}${LANDING_IP:-落地机}${NC} (干净IP，解锁流媒体)"
-echo ""
-
-echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│  【节点链接】 — 导入到客户端使用                           │${NC}"
-echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-if [[ ${#FINAL_LINKS[@]} -gt 0 ]]; then
-    for (( i=0; i<${#FINAL_LINKS[@]}; i++ )); do
-        echo -e "  ${CYAN}节点 $((i+1)):${NC}"
-        echo -e "  ${GREEN}${FINAL_LINKS[$i]}${NC}"
-        echo ""
-    done
-else
-    print_warn "链接生成失败，请查看 $NODES_FILE 或手动生成"
-    echo ""
-    for (( i=0; i<${#SELECTED_PORTS[@]}; i++ )); do
-        port="${SELECTED_PORTS[$i]}"
-        echo -e "  端口 ${GREEN}$port${NC} → 中转机入口: ${GREEN}${RELAY_IP}:${port}${NC}"
-    done
-fi
-echo ""
-
-echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│  【中转机端口转发】 — 已在中转机添加                       │${NC}"
-echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-for port in "${SELECTED_PORTS[@]}"; do
-    echo -e "  ${RELAY_IP}:${GREEN}${port}${NC} → ${LANDING_IP:-落地机}:${GREEN}${port}${NC}"
-done
-echo ""
-
-echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│  【常用命令】                                               │${NC}"
-echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-echo -e "  查看所有信息:  ${CYAN}relay-info${NC}"
-echo -e "  查看节点链接:  ${CYAN}cat /opt/relay-wg/config/nodes.txt${NC}"
-echo -e "  查看WG状态:    ${CYAN}wg show${NC}"
-echo -e "  重新对接:      ${CYAN}bash duijie.sh${NC}"
-echo ""
-echo -e "${GREEN}随时运行 ${CYAN}relay-info${GREEN} 查看节点链接和连接状态${NC}"
-echo ""
+main "$@"

@@ -49,6 +49,7 @@ print_banner() {
 # 动态查找 Xray 二进制（本机落地机用）
 # ============================================================
 find_xray_bin() {
+    # 方法1: 常见固定路径
     local candidates=(
         "/usr/local/bin/xray"
         "/usr/bin/xray"
@@ -58,9 +59,22 @@ find_xray_bin() {
     for p in "${candidates[@]}"; do
         [[ -x "$p" ]] && { echo "$p"; return 0; }
     done
+    # 方法2: PATH 查找
     local w
     w=$(command -v xray 2>/dev/null || echo "")
     [[ -n "$w" && -x "$w" ]] && { echo "$w"; return 0; }
+    # 方法3: 从 systemd 服务文件提取实际路径
+    local svc_bin
+    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null         | grep -oP 'path=\K[^;]+' | head -1 | tr -d '[:space:]')
+    [[ -n "$svc_bin" && -x "$svc_bin" ]] && { echo "$svc_bin"; return 0; }
+    # 方法4: 从运行中的进程提取
+    local proc_bin
+    proc_bin=$(ps -eo cmd --no-headers 2>/dev/null         | grep -v grep | grep -i 'xray' | awk '{print $1}' | head -1)
+    [[ -n "$proc_bin" && -x "$proc_bin" ]] && { echo "$proc_bin"; return 0; }
+    # 方法5: 全盘搜索（兜底）
+    local found
+    found=$(find /usr /opt /root -maxdepth 5 -name 'xray' -type f         -perm /111 2>/dev/null | head -1)
+    [[ -n "$found" ]] && { echo "$found"; return 0; }
     return 1
 }
 
@@ -356,8 +370,15 @@ gen_relay_keys() {
     info "生成中转机入站 Reality 密钥对..."
 
     local xray_bin
-    xray_bin=$(find_xray_bin) || \
-        error "未找到本地 Xray 二进制，无法生成密钥\n实际文件: $(find /usr /opt -name 'xray' -type f 2>/dev/null | head -5 || echo '无')"
+    xray_bin=$(find_xray_bin) || {
+        echo -e "${RED}[ERROR]${NC} 未找到本地 Xray 二进制，无法生成密钥"
+        echo "  全盘搜索: $(find /usr /opt /root -name 'xray' -type f 2>/dev/null | head -5 || echo '无')"
+        echo "  systemd : $(systemctl show xray --property=ExecStart 2>/dev/null | head -1 || echo '无')"
+        echo "  进程    : $(ps -eo cmd --no-headers 2>/dev/null | grep -v grep | grep -i xray | head -2 || echo '无')"
+        echo ""
+        echo "  请确认落地机 v2ray-agent 已正确安装，或手动运行: vasma"
+        exit 1
+    }
 
     local key_out
     key_out=$("$xray_bin" x25519 2>/dev/null) || \

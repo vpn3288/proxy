@@ -195,6 +195,25 @@ PYEOF
     info "监听端口: $PORT"
     info "UUID    : $UUID"
     info "SNI     : $SNI"
+
+    # ── 允许用户手动确认或修改关键参数 ──────────────────────
+    echo ""
+    echo -e "${YELLOW}── 请确认/修改以下参数（直接回车保留自动读取值）──${NC}"
+
+    read -rp "VLESS 端口 [当前: $PORT]: " INPUT_PORT
+    [[ -n "$INPUT_PORT" ]] && PORT="$INPUT_PORT"
+
+    read -rp "UUID    [当前: $UUID]: " INPUT_UUID
+    [[ -n "$INPUT_UUID" ]] && UUID="$INPUT_UUID"
+
+    read -rp "SNI 伪装域名 [当前: $SNI]: " INPUT_SNI
+    [[ -n "$INPUT_SNI" ]] && SNI="$INPUT_SNI"
+
+    read -rp "Short ID [当前: ${SHORT_ID:-（空）}]: " INPUT_SID
+    [[ -n "$INPUT_SID" ]] && SHORT_ID="$INPUT_SID"
+
+    echo ""
+    info "最终使用 → 端口: $PORT | UUID: $UUID | SNI: $SNI | ShortID: ${SHORT_ID:-（空）}"
 }
 
 # ============================================================

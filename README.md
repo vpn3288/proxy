@@ -6,3 +6,6 @@ bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/l
 
 # 对接
 bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/duijie.sh)
+
+# 查看信息
+relay-info

@@ -37,7 +37,7 @@ print_title() {
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════════╗"
     echo "║        CN2GIA中转机 WireGuard + Mack-a 一键部署工具             ║"
-    echo "║                    v1.12                                       ║"
+    echo "║                    v1.13                                       ║"
     echo "╚════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -240,7 +240,8 @@ print_section "步骤 3/8: 安装依赖"
 # ============================================================================
 
 print_info "更新软件包列表..."
-apt-get update -qq
+# 忽略第三方仓库错误（如 nginx mainline 在 Ubuntu 24.04 上路径变化）
+apt-get update -qq 2>/dev/null || apt-get update -qq --allow-insecure-repositories 2>/dev/null || true
 
 # ---- 基础包 ----
 BASE_PKGS="wireguard wireguard-tools curl wget net-tools iptables"

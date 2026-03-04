@@ -35,11 +35,15 @@
 ### 第一步：落地机
 
 # 删除冲突的 nginx 源
+```bash
 rm -f /etc/apt/sources.list.d/nginx.list
 rm -f /etc/apt/sources.list.d/*nginx*
+```
 
+```bash
 # 更新 apt
 apt-get update
+```
 
 登录落地机，执行以下命令（全自动安装，无需任何输入）：
 

@@ -1,9 +1,8 @@
 #!/bin/bash
 # ============================================================
-# luodi.sh — 落地机信息读取脚本 v3.1
+# luodi.sh — 落地机信息读取脚本 v4.0
 # 功能：读取 v2ray-agent 已安装的 Xray VLESS Reality 配置
 #       生成落地机信息文件，供 duijie.sh 对接使用
-# 修复：动态检测 Xray 路径、公钥推导容错、v26 格式兼容
 # 使用：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/luodi.sh)
 # ============================================================
 
@@ -26,8 +25,6 @@ MACK_A_CONF_DIR="/etc/v2ray-agent/xray/conf"
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本"
 
 # ============================================================
-# 打印 Banner
-# ============================================================
 print_banner() {
     echo -e "${CYAN}"
     echo "  ██╗     ██╗   ██╗ ██████╗ ██████╗ ██╗"
@@ -36,15 +33,14 @@ print_banner() {
     echo "  ██║     ██║   ██║██║   ██║██║  ██║██║"
     echo "  ███████╗╚██████╔╝╚██████╔╝██████╔╝██║"
     echo "  ╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚═╝"
-    echo -e "  落地机信息读取脚本 v3.1 — 读取 v2ray-agent 配置${NC}"
+    echo -e "  落地机信息读取脚本 v4.0 — 读取 v2ray-agent 配置${NC}"
     echo ""
 }
 
 # ============================================================
-# 动态查找 Xray 二进制路径（五级兜底，适配任意安装位置）
+# 动态查找 Xray 二进制路径（五级兜底）
 # ============================================================
 find_xray_bin() {
-    # 方法1: 常见固定路径（含 v2ray-agent 实际安装路径）
     local candidates=(
         "/etc/v2ray-agent/xray/xray"
         "/usr/local/bin/xray"
@@ -55,21 +51,20 @@ find_xray_bin() {
     for p in "${candidates[@]}"; do
         [[ -x "$p" ]] && { echo "$p"; return 0; }
     done
-    # 方法2: PATH 查找
     local w
     w=$(command -v xray 2>/dev/null || echo "")
     [[ -n "$w" && -x "$w" ]] && { echo "$w"; return 0; }
-    # 方法3: 从 systemd 服务文件提取实际路径（兼容不支持 grep -P 的系统）
     local svc_bin
-    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null         | grep -o 'path=[^;]*' | head -1 | sed 's/path=//' | tr -d ' ')
+    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null \
+        | grep -o 'path=[^;]*' | head -1 | sed 's/path=//' | tr -d ' ')
     [[ -n "$svc_bin" && -x "$svc_bin" ]] && { echo "$svc_bin"; return 0; }
-    # 方法4: 从运行中的进程提取
     local proc_bin
-    proc_bin=$(ps -eo cmd --no-headers 2>/dev/null         | grep -v grep | grep -i 'xray' | awk '{print $1}' | head -1)
+    proc_bin=$(ps -eo cmd --no-headers 2>/dev/null \
+        | grep -v grep | grep -i 'xray' | awk '{print $1}' | head -1)
     [[ -n "$proc_bin" && -x "$proc_bin" ]] && { echo "$proc_bin"; return 0; }
-    # 方法5: 全盘搜索（兜底，覆盖任意安装位置）
     local found
-    found=$(find / -maxdepth 6 -name 'xray' -type f         -perm /111 2>/dev/null | grep -v proc | head -1)
+    found=$(find / -maxdepth 6 -name 'xray' -type f \
+        -perm /111 2>/dev/null | grep -v proc | head -1)
     [[ -n "$found" ]] && { echo "$found"; return 0; }
     return 1
 }
@@ -85,14 +80,11 @@ check_mack_a() {
 
     XRAY_BIN=$(find_xray_bin) || {
         echo -e "${RED}[ERROR]${NC} 未找到 Xray 二进制文件"
-        echo "  全盘搜索结果: $(find /usr /opt /root -name 'xray' -type f 2>/dev/null | head -5 || echo '无')"
-        echo "  systemd 服务: $(systemctl show xray --property=ExecStart 2>/dev/null | head -1 || echo '无')"
-        echo "  运行中进程 : $(ps -eo cmd --no-headers 2>/dev/null | grep -v grep | grep -i xray | head -2 || echo '无')"
-        echo ""
-        echo "  请确认 v2ray-agent 已正确安装，或手动运行: vasma"
+        echo "  全盘搜索: $(find / -name 'xray' -type f 2>/dev/null | grep -v proc | head -5 || echo '无')"
+        echo "  systemd : $(systemctl show xray --property=ExecStart 2>/dev/null | head -1 || echo '无')"
+        echo "  进程    : $(ps -eo cmd --no-headers 2>/dev/null | grep -v grep | grep -i xray | head -2 || echo '无')"
         exit 1
     }
-
     info "Xray 路径: $XRAY_BIN"
 
     if ! systemctl is-active --quiet xray 2>/dev/null; then
@@ -122,53 +114,39 @@ for fpath in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
             data = json.load(f)
     except Exception:
         continue
-
     inbounds = data.get("inbounds", [])
     if not isinstance(inbounds, list):
         continue
-
     for ib in inbounds:
         if not isinstance(ib, dict):
             continue
         if ib.get("protocol", "").lower() != "vless":
             continue
-
         stream = ib.get("streamSettings", {})
         if stream.get("security") != "reality":
             continue
-
         reality_cfg = stream.get("realitySettings", {})
         if not reality_cfg:
             continue
-
         port = ib.get("port")
         if not port:
             continue
-
         clients = ib.get("settings", {}).get("clients", [])
         uuid = clients[0].get("id", "") if clients else ""
-
         private_key  = reality_cfg.get("privateKey", "")
         short_ids    = reality_cfg.get("shortIds", [""])
         short_id     = short_ids[0] if short_ids else ""
         server_names = reality_cfg.get("serverNames", [""])
         sni          = server_names[0] if server_names else ""
         dest         = reality_cfg.get("dest", "")
-
         if not private_key:
             continue
-
         result = {
-            "port":        port,
-            "uuid":        uuid,
-            "private_key": private_key,
-            "short_id":    short_id,
-            "sni":         sni,
-            "dest":        dest,
-            "file":        fpath
+            "port": port, "uuid": uuid,
+            "private_key": private_key, "short_id": short_id,
+            "sni": sni, "dest": dest, "file": fpath
         }
         break
-
     if result:
         break
 
@@ -189,27 +167,38 @@ PYEOF
         error "未在 $MACK_A_CONF_DIR 中找到 VLESS Reality 入站配置\n请确认 v2ray-agent 已安装 VLESS Vision Reality 协议"
     fi
 
-    eval "$found"
+    # 逐行安全解析，避免 eval 潜在风险
+    while IFS='=' read -r key val; do
+        case "$key" in
+            PORT)        PORT="$val"        ;;
+            UUID)        UUID="$val"        ;;
+            PRIVATE_KEY) PRIVATE_KEY="$val" ;;
+            SHORT_ID)    SHORT_ID="$val"    ;;
+            SNI)         SNI="$val"         ;;
+            DEST)        DEST="$val"        ;;
+            SOURCE_FILE) SOURCE_FILE="$val" ;;
+        esac
+    done <<< "$found"
 
     info "来源文件: $SOURCE_FILE"
     info "监听端口: $PORT"
     info "UUID    : $UUID"
     info "SNI     : $SNI"
 
-    # ── 允许用户手动确认或修改关键参数 ──────────────────────
+    # 允许用户手动确认或修改关键参数
     echo ""
     echo -e "${YELLOW}── 请确认/修改以下参数（直接回车保留自动读取值）──${NC}"
 
-    read -rp "VLESS 端口 [当前: $PORT]: " INPUT_PORT
+    read -rp "VLESS 端口     [当前: $PORT]: " INPUT_PORT
     [[ -n "$INPUT_PORT" ]] && PORT="$INPUT_PORT"
 
-    read -rp "UUID    [当前: $UUID]: " INPUT_UUID
+    read -rp "UUID           [当前: $UUID]: " INPUT_UUID
     [[ -n "$INPUT_UUID" ]] && UUID="$INPUT_UUID"
 
-    read -rp "SNI 伪装域名 [当前: $SNI]: " INPUT_SNI
+    read -rp "SNI 伪装域名   [当前: $SNI]: " INPUT_SNI
     [[ -n "$INPUT_SNI" ]] && SNI="$INPUT_SNI"
 
-    read -rp "Short ID [当前: ${SHORT_ID:-（空）}]: " INPUT_SID
+    read -rp "Short ID       [当前: ${SHORT_ID:-（空）}]: " INPUT_SID
     [[ -n "$INPUT_SID" ]] && SHORT_ID="$INPUT_SID"
 
     echo ""
@@ -217,13 +206,12 @@ PYEOF
 }
 
 # ============================================================
-# 用私钥推导公钥（修复：禁止 fallback 生成新密钥）
+# 用私钥推导公钥
 # ============================================================
 derive_public_key() {
     info "从私钥推导公钥..."
 
     local key_out
-    # 必须用已有私钥推导，禁止无参数 fallback
     key_out=$("$XRAY_BIN" x25519 -i "$PRIVATE_KEY" 2>&1) || {
         error "xray x25519 -i 执行失败，输出:\n$key_out"
     }
@@ -232,14 +220,12 @@ derive_public_key() {
     PUBLIC_KEY=$(echo "$key_out" | grep -i "^Password:"   | awk '{print $NF}' | tr -d '[:space:]')
     [[ -z "$PUBLIC_KEY" ]] && \
     PUBLIC_KEY=$(echo "$key_out" | grep -i "^Public key:" | awk '{print $NF}' | tr -d '[:space:]')
-
-    # 再尝试第二行（某些版本直接输出两行 key）
-    if [[ -z "$PUBLIC_KEY" ]]; then
-        PUBLIC_KEY=$(echo "$key_out" | sed -n '2p' | tr -d '[:space:]')
-    fi
+    # 兼容直接两行输出格式
+    [[ -z "$PUBLIC_KEY" ]] && \
+    PUBLIC_KEY=$(echo "$key_out" | sed -n '2p' | tr -d '[:space:]')
 
     [[ -z "$PUBLIC_KEY" ]] && \
-        error "无法从私钥推导公钥。\nXray 版本: $($XRAY_BIN version 2>/dev/null | head -1)\n原始输出:\n$key_out"
+        error "无法推导公钥\nXray: $($XRAY_BIN version 2>/dev/null | head -1)\n原始输出:\n$key_out"
 
     success "公钥: $PUBLIC_KEY"
 }
@@ -312,9 +298,6 @@ print_result() {
     echo ""
 }
 
-# ============================================================
-# 主流程
-# ============================================================
 main() {
     print_banner
     check_mack_a

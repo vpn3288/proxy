@@ -1,10 +1,7 @@
 #!/bin/bash
 # ============================================================
-# zhongzhuan.sh — 中转机信息读取脚本 v3.1
-# 功能：读取 v2ray-agent 已安装的 Xray 配置
-#       初始化中转机节点记录，供 duijie.sh 注入落地机配置
-# 修复：动态检测 Xray 路径、Xray 检查改为非强依赖、
-#       nodes.json 目录自动创建
+# zhongzhuan.sh — 中转机初始化脚本 v4.0
+# 功能：在中转机上运行，初始化节点记录，供 duijie.sh 对接使用
 # 使用：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/zhongzhuan.sh)
 # ============================================================
 
@@ -37,15 +34,16 @@ print_banner() {
     echo "   ███╔╝  ██╔══██║██║   ██║██║╚██╗██║██║   ██║"
     echo "  ███████╗██║  ██║╚██████╔╝██║ ╚████║╚██████╔╝"
     echo "  ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝"
-    echo -e "  中转机配置脚本 v3.1 — 读取 v2ray-agent 配置${NC}"
+    echo -e "  中转机初始化脚本 v4.0${NC}"
     echo ""
 }
 
 # ============================================================
-# 动态查找 Xray 二进制路径
+# 动态查找 Xray 二进制路径（五级兜底）
 # ============================================================
 find_xray_bin() {
     local candidates=(
+        "/etc/v2ray-agent/xray/xray"
         "/usr/local/bin/xray"
         "/usr/bin/xray"
         "/usr/local/share/xray/xray"
@@ -57,11 +55,23 @@ find_xray_bin() {
     local w
     w=$(command -v xray 2>/dev/null || echo "")
     [[ -n "$w" && -x "$w" ]] && { echo "$w"; return 0; }
+    local svc_bin
+    svc_bin=$(systemctl show xray --property=ExecStart 2>/dev/null \
+        | grep -o 'path=[^;]*' | head -1 | sed 's/path=//' | tr -d ' ')
+    [[ -n "$svc_bin" && -x "$svc_bin" ]] && { echo "$svc_bin"; return 0; }
+    local proc_bin
+    proc_bin=$(ps -eo cmd --no-headers 2>/dev/null \
+        | grep -v grep | grep -i 'xray' | awk '{print $1}' | head -1)
+    [[ -n "$proc_bin" && -x "$proc_bin" ]] && { echo "$proc_bin"; return 0; }
+    local found
+    found=$(find / -maxdepth 6 -name 'xray' -type f \
+        -perm /111 2>/dev/null | grep -v proc | head -1)
+    [[ -n "$found" ]] && { echo "$found"; return 0; }
     return 1
 }
 
 # ============================================================
-# 检查 v2ray-agent（中转机不需要用 xray 二进制，检查仅作提示）
+# 检查 v2ray-agent
 # ============================================================
 check_mack_a() {
     info "检查 v2ray-agent 安装状态..."
@@ -71,15 +81,12 @@ check_mack_a() {
 
     # Xray 路径检查：仅提示，不阻断（中转机初始化不需要调用 xray 二进制）
     local xray_bin
-    if xray_bin=$(find_xray_bin); then
+    if xray_bin=$(find_xray_bin 2>/dev/null); then
         info "Xray 路径: $xray_bin"
     else
-        warn "未找到 Xray 二进制（常见路径均无），请确认 v2ray-agent 安装正常"
-        warn "实际文件: $(find /usr /opt -name 'xray' -type f 2>/dev/null | head -5 || echo '无')"
-        warn "继续执行（中转机初始化不需要调用 xray）"
+        warn "未找到 Xray 二进制，请确认 v2ray-agent 安装正常（不影响初始化继续）"
     fi
 
-    # 检查 Xray 服务是否运行
     if systemctl is-active --quiet xray 2>/dev/null; then
         success "Xray 服务运行中"
     else
@@ -135,7 +142,7 @@ get_user_input() {
         warn "请输入 1024-65000 之间的合法端口"
     done
 
-    local END_PORT=$(( START_PORT + NODE_COUNT - 1 ))
+    END_PORT=$(( START_PORT + NODE_COUNT - 1 ))
     info "将为 $NODE_COUNT 台落地机预留端口: $START_PORT ~ $END_PORT"
     echo ""
     echo -e "${YELLOW}注意：duijie.sh 会在此范围内自动分配端口${NC}"
@@ -153,11 +160,11 @@ init_nodes_file() {
     if [[ -f "$NODES_FILE" ]]; then
         local existing
         existing=$(python3 -c "
-import json, sys
+import json
 try:
     d = json.load(open('$NODES_FILE'))
     print(len(d.get('nodes', [])))
-except Exception as e:
+except Exception:
     print(0)
 " 2>/dev/null || echo 0)
 
@@ -180,24 +187,24 @@ except Exception as e:
 
 # ============================================================
 # 检查并开放防火墙端口（ufw / iptables）
+# 修复：统一使用 END_PORT（大写），在 get_user_input 中赋值
 # ============================================================
 open_firewall_ports() {
-    local end_port=$(( START_PORT + NODE_COUNT - 1 ))
     echo ""
-    read -rp "是否自动开放防火墙端口 $START_PORT~$END_PORT？[Y/n]: " DO_FW
+    read -rp "是否自动开放防火墙端口 ${START_PORT}~${END_PORT}？[Y/n]: " DO_FW
     if [[ "${DO_FW,,}" != "n" ]]; then
         if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
             info "通过 ufw 开放端口..."
-            ufw allow "${START_PORT}:${end_port}/tcp" >/dev/null 2>&1 && \
-                success "ufw 已放行 ${START_PORT}:${end_port}/tcp" || \
+            ufw allow "${START_PORT}:${END_PORT}/tcp" >/dev/null 2>&1 && \
+                success "ufw 已放行 ${START_PORT}:${END_PORT}/tcp" || \
                 warn "ufw 开放失败，请手动处理"
         elif command -v iptables &>/dev/null; then
             info "通过 iptables 开放端口..."
-            iptables -I INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT 2>/dev/null && \
-                success "iptables 已放行 ${START_PORT}:${end_port}/tcp" || \
+            iptables -I INPUT -p tcp --dport "${START_PORT}:${END_PORT}" -j ACCEPT 2>/dev/null && \
+                success "iptables 已放行 ${START_PORT}:${END_PORT}/tcp" || \
                 warn "iptables 开放失败，请手动处理"
         else
-            warn "未检测到 ufw/iptables，请手动在安全组放行端口 ${START_PORT}~${end_port}"
+            warn "未检测到 ufw/iptables，请手动在安全组放行端口 ${START_PORT}~${END_PORT}"
         fi
     fi
 }
@@ -206,7 +213,6 @@ open_firewall_ports() {
 # 保存中转机信息
 # ============================================================
 save_info() {
-    local END_PORT=$(( START_PORT + NODE_COUNT - 1 ))
     cat > "$INFO_FILE" << EOF
 ============================================================
   中转机信息  $(date '+%Y-%m-%d %H:%M:%S')
@@ -219,15 +225,15 @@ v2ray-agent 目录  : ${MACK_A_CONF_DIR}
 
 ── 说明 ──────────────────────────────────────────────────
 duijie.sh 在落地机上运行，SSH 连接到本机后：
-  1. 在 $MACK_A_CONF_DIR 添加三个独立配置文件（入站/出站/路由）
-  2. 不修改 v2ray-agent 原有配置
+  1. 在 $MACK_A_CONF_DIR 添加入站/出站配置文件
+  2. 将路由规则注入到 09_routing.json 最前面（最高优先级）
   3. 重启 Xray 生效
 
 ── 管理命令 ──────────────────────────────────────────────
 查看已对接节点  : cat ${NODES_FILE} | python3 -m json.tool
 重启 Xray       : systemctl restart xray
 查看 Xray 状态  : systemctl status xray
-查看 Xray 日志  : journalctl -u xray -n 50 --no-pager
+查看 Xray 日志  : journalctl -u xray -f --no-pager | grep relay
 ============================================================
 
 ZHONGZHUAN_IP=${PUBLIC_IP}
@@ -244,7 +250,7 @@ EOF
 print_result() {
     echo ""
     echo -e "${CYAN}============================================================${NC}"
-    echo -e "${GREEN}  中转机配置完成！${NC}"
+    echo -e "${GREEN}  中转机初始化完成！${NC}"
     echo -e "${CYAN}============================================================${NC}"
     cat "$INFO_FILE"
     echo ""
@@ -252,9 +258,6 @@ print_result() {
     echo ""
 }
 
-# ============================================================
-# 主流程
-# ============================================================
 main() {
     print_banner
     check_mack_a

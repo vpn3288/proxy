@@ -1,10 +1,11 @@
 #!/bin/bash
 # ============================================================
-# duijie.sh v5.0 — 落地机对接中转机脚本
+# duijie.sh v5.1 — 落地机对接中转机脚本
 # 功能：在落地机上运行，SSH 到中转机，自动写入
 #       relay 入站 + 出站 + 路由规则，生成用户节点链接
 # 用法：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/duijie.sh)
 # 前置：落地机已运行 luodi.sh，中转机已运行 zhongzhuan.sh
+# 修复：v5.1 manual模式节点链接/IP确认校验
 # ============================================================
 
 set -e
@@ -27,35 +28,37 @@ LUODI_PRIVKEY="" LUODI_SHORT_ID="" LUODI_SNI="" LUODI_DEST=""
 
 # 中转机变量
 RELAY_IP="" RELAY_SSH_PORT="22" RELAY_SSH_USER="root"
-RELAY_SSH_PASS="" RELAY_KEY_FILE=""
+RELAY_SSH_PASS="" RELAY_KEY_FILE="" SSH_OPTS=""
 RELAY_PRIVKEY="" RELAY_PUBKEY="" RELAY_SHORT_ID="" RELAY_SNI=""
-RELAY_START_PORT="" RELAY_CONFIG="" RELAY_NODES="" RELAY_XRAY_BIN=""
+RELAY_DEST="" RELAY_START_PORT="" RELAY_CONFIG="" RELAY_NODES=""
+RELAY_XRAY_BIN=""
 AUTH_TYPE=""
 
 # 结果
 RELAY_ASSIGNED_PORT="" NEW_UUID="" NODE_LINK="" NODE_LABEL=""
 
-# ── SSH 执行工具函数 ──────────────────────────────────────
-# 在中转机上执行命令
+# ── SSH 执行工具 ──────────────────────────────────────────
 run_relay() {
     local cmd="$1"
     case "$AUTH_TYPE" in
         key)      ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "$cmd" ;;
         password) sshpass -p "$RELAY_SSH_PASS" \
-                      ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "$cmd" ;;
+                    ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "$cmd" ;;
         keyfile)  ssh -q $SSH_OPTS -i "$RELAY_KEY_FILE" \
-                      "${RELAY_SSH_USER}@${RELAY_IP}" "$cmd" ;;
+                    "${RELAY_SSH_USER}@${RELAY_IP}" "$cmd" ;;
+        manual)   log_error "manual 模式不支持 run_relay" ;;
     esac
 }
 
-# 通过 stdin 管道在中转机上运行 Python
+# stdin 管道到中转机 python3
 pipe_python_relay() {
     case "$AUTH_TYPE" in
         key)      ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "python3" ;;
         password) sshpass -p "$RELAY_SSH_PASS" \
-                      ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "python3" ;;
+                    ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "python3" ;;
         keyfile)  ssh -q $SSH_OPTS -i "$RELAY_KEY_FILE" \
-                      "${RELAY_SSH_USER}@${RELAY_IP}" "python3" ;;
+                    "${RELAY_SSH_USER}@${RELAY_IP}" "python3" ;;
+        manual)   log_error "manual 模式不支持 pipe_python_relay" ;;
     esac
 }
 
@@ -68,31 +71,37 @@ read_luodi_info() {
         while IFS='=' read -r key val; do
             val=$(echo "$val" | tr -d '\r')
             case "$key" in
-                LUODI_IP)          LUODI_IP="$val"          ;;
-                LUODI_RELAY_PORT)  LUODI_RELAY_PORT="$val"  ;;
-                LUODI_UUID)        LUODI_UUID="$val"        ;;
-                LUODI_PUBKEY)      LUODI_PUBKEY="$val"      ;;
-                LUODI_PRIVKEY)     LUODI_PRIVKEY="$val"     ;;
-                LUODI_SHORT_ID)    LUODI_SHORT_ID="$val"    ;;
-                LUODI_SNI)         LUODI_SNI="$val"         ;;
-                LUODI_DEST)        LUODI_DEST="$val"        ;;
+                LUODI_IP)         LUODI_IP="$val"         ;;
+                LUODI_RELAY_PORT) LUODI_RELAY_PORT="$val" ;;
+                LUODI_UUID)       LUODI_UUID="$val"       ;;
+                LUODI_PUBKEY)     LUODI_PUBKEY="$val"     ;;
+                LUODI_PRIVKEY)    LUODI_PRIVKEY="$val"    ;;
+                LUODI_SHORT_ID)   LUODI_SHORT_ID="$val"   ;;
+                LUODI_SNI)        LUODI_SNI="$val"        ;;
+                LUODI_DEST)       LUODI_DEST="$val"       ;;
             esac
         done < "$LOCAL_INFO"
     fi
 
-    # 若信息不完整则提示手动输入
     echo ""
     echo -e "${YELLOW}── 确认落地机信息（回车保留自动读取值）──${NC}"
-    read -rp "落地机 IP               [${LUODI_IP:-待输入}]: "         i; [[ -n "$i" ]] && LUODI_IP="$i"
-    read -rp "中转专用端口            [${LUODI_RELAY_PORT:-待输入}]: "  i; [[ -n "$i" ]] && LUODI_RELAY_PORT="$i"
-    read -rp "UUID                    [${LUODI_UUID:-待输入}]: "        i; [[ -n "$i" ]] && LUODI_UUID="$i"
-    read -rp "公钥 (pubkey)           [${LUODI_PUBKEY:-待输入}]: "      i; [[ -n "$i" ]] && LUODI_PUBKEY="$i"
-    read -rp "SNI                     [${LUODI_SNI:-待输入}]: "         i; [[ -n "$i" ]] && LUODI_SNI="$i"
-    read -rp "Short ID                [${LUODI_SHORT_ID:-空}]: "        i; [[ -n "$i" ]] && LUODI_SHORT_ID="$i"
-    read -rp "节点标签（显示名称）    [LuoDi-${LUODI_IP}]: "            i
+    read -rp "落地机 IP            [${LUODI_IP:-待输入}]: "        i
+    [[ -n "$i" ]] && LUODI_IP="$i"
+    read -rp "中转专用端口         [${LUODI_RELAY_PORT:-待输入}]: " i
+    [[ -n "$i" ]] && LUODI_RELAY_PORT="$i"
+    read -rp "UUID                 [${LUODI_UUID:-待输入}]: "       i
+    [[ -n "$i" ]] && LUODI_UUID="$i"
+    read -rp "公钥 (pubkey)        [${LUODI_PUBKEY:-待输入}]: "     i
+    [[ -n "$i" ]] && LUODI_PUBKEY="$i"
+    read -rp "SNI                  [${LUODI_SNI:-待输入}]: "        i
+    [[ -n "$i" ]] && LUODI_SNI="$i"
+    read -rp "Short ID             [${LUODI_SHORT_ID:-空}]: "       i
+    [[ -n "$i" ]] && LUODI_SHORT_ID="$i"
+    read -rp "节点标签             [LuoDi-${LUODI_IP}]: "           i
     NODE_LABEL="${i:-LuoDi-${LUODI_IP}}"
 
-    [[ -z "$LUODI_IP" || -z "$LUODI_RELAY_PORT" || -z "$LUODI_UUID" || -z "$LUODI_PUBKEY" ]] && \
+    [[ -z "$LUODI_IP" || -z "$LUODI_RELAY_PORT" || \
+       -z "$LUODI_UUID" || -z "$LUODI_PUBKEY" ]] && \
         log_error "落地机信息不完整，请先运行 luodi.sh"
     log_info "落地机: $LUODI_IP:$LUODI_RELAY_PORT"
 }
@@ -103,53 +112,52 @@ setup_ssh() {
     echo -e "${YELLOW}── 中转机 SSH 连接信息 ──${NC}"
     read -rp "中转机公网 IP: " RELAY_IP
     [[ -z "$RELAY_IP" ]] && log_error "中转机 IP 不能为空"
-    read -rp "SSH 端口 [22]: " i; RELAY_SSH_PORT="${i:-22}"
+    read -rp "SSH 端口 [22]: " i;   RELAY_SSH_PORT="${i:-22}"
     read -rp "SSH 用户 [root]: " i; RELAY_SSH_USER="${i:-root}"
 
-    SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-              -o BatchMode=yes -p $RELAY_SSH_PORT"
+    SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $RELAY_SSH_PORT"
 
     echo ""
     echo -e "${YELLOW}选择 SSH 认证方式：${NC}"
-    echo -e "  ${CYAN}[1]${NC} 密钥登录（默认，尝试 ~/.ssh/id_rsa）"
+    echo -e "  ${CYAN}[1]${NC} 密钥登录（默认，~/.ssh/id_rsa）"
     echo -e "  ${CYAN}[2]${NC} 指定密钥文件路径"
     echo -e "  ${CYAN}[3]${NC} 密码登录"
-    echo -e "  ${CYAN}[4]${NC} 显示手动命令（无法 SSH 时使用）"
+    echo -e "  ${CYAN}[4]${NC} 手动模式（无法 SSH 时）"
     read -rp "选择 [1]: " choice; choice="${choice:-1}"
 
     case "$choice" in
         1)
             AUTH_TYPE="key"
-            if ! ssh -q $SSH_OPTS "${RELAY_SSH_USER}@${RELAY_IP}" "exit" 2>/dev/null; then
-                log_warn "密钥认证失败，请检查是否已配置免密登录"
-                echo "  提示：在中转机上执行 'cat ~/.ssh/authorized_keys' 确认落地机公钥已添加"
+            local test_opts="$SSH_OPTS -o BatchMode=yes"
+            if ssh -q $test_opts "${RELAY_SSH_USER}@${RELAY_IP}" "exit" 2>/dev/null; then
+                log_info "密钥认证成功"
+                SSH_OPTS="$test_opts"
+            else
+                log_warn "密钥认证失败"
+                echo "  提示：在中转机执行 'cat ~/.ssh/authorized_keys' 确认公钥"
                 read -rp "继续尝试？[y/N]: " yn
                 [[ "${yn,,}" != "y" ]] && { AUTH_TYPE="manual"; return; }
-            else
-                log_info "密钥认证成功"
+                SSH_OPTS="$test_opts"
             fi
             ;;
         2)
             read -rp "密钥文件路径 [~/.ssh/id_rsa]: " RELAY_KEY_FILE
             RELAY_KEY_FILE="${RELAY_KEY_FILE:-~/.ssh/id_rsa}"
             RELAY_KEY_FILE="${RELAY_KEY_FILE/#\~/$HOME}"
-            [[ ! -f "$RELAY_KEY_FILE" ]] && log_error "密钥文件不存在: $RELAY_KEY_FILE"
+            [[ ! -f "$RELAY_KEY_FILE" ]] && \
+                log_error "密钥文件不存在: $RELAY_KEY_FILE"
             AUTH_TYPE="keyfile"
-            SSH_OPTS="${SSH_OPTS/ -o BatchMode=yes/}"  # keyfile 不需要 BatchMode
-            log_info "使用密钥: $RELAY_KEY_FILE"
+            log_info "密钥文件: $RELAY_KEY_FILE"
             ;;
         3)
             if ! command -v sshpass &>/dev/null; then
                 log_warn "安装 sshpass..."
                 apt-get install -y -qq sshpass 2>/dev/null || true
             fi
-            command -v sshpass &>/dev/null || log_error "sshpass 安装失败，请改用密钥登录"
+            command -v sshpass &>/dev/null || \
+                log_error "sshpass 安装失败，请改用密钥登录"
             read -rsp "SSH 密码: " RELAY_SSH_PASS; echo ""
             AUTH_TYPE="password"
-            SSH_OPTS="${SSH_OPTS/ -o BatchMode=yes/}"
-            ;;
-        4)
-            AUTH_TYPE="manual"
             ;;
         *)
             AUTH_TYPE="manual"
@@ -159,64 +167,100 @@ setup_ssh() {
 
 # ── 读取中转机信息 ────────────────────────────────────────
 read_relay_info() {
-    [[ "$AUTH_TYPE" == "manual" ]] && return
-    log_step "读取中转机配置..."
+    if [[ "$AUTH_TYPE" == "manual" ]]; then
+        # BUG-5 修复：manual 模式下手动输入中转机参数
+        echo ""
+        echo -e "${YELLOW}── 手动输入中转机参数（从中转机 cat /root/xray_zhongzhuan_info.txt 获取）──${NC}"
+        read -rp "中转机公钥 (ZHONGZHUAN_PUBKEY): "   RELAY_PUBKEY
+        read -rp "中转机 SNI (ZHONGZHUAN_SNI): "      RELAY_SNI
+        read -rp "中转机 Short ID (ZHONGZHUAN_SHORT_ID): " RELAY_SHORT_ID
+        read -rp "中转机私钥 (ZHONGZHUAN_PRIVKEY): "  RELAY_PRIVKEY
+        read -rp "起始端口 (ZHONGZHUAN_START_PORT) [30001]: " i
+        RELAY_START_PORT="${i:-30001}"
+        read -rp "中转机 config.json 路径 [/usr/local/etc/xray-relay/config.json]: " i
+        RELAY_CONFIG="${i:-/usr/local/etc/xray-relay/config.json}"
+        read -rp "中转机 nodes.json 路径 [/usr/local/etc/xray-relay/nodes.json]: " i
+        RELAY_NODES="${i:-/usr/local/etc/xray-relay/nodes.json}"
+        read -rp "中转机 Xray 路径 [/usr/local/bin/xray]: " i
+        RELAY_XRAY_BIN="${i:-/usr/local/bin/xray}"
+        RELAY_DEST="${RELAY_SNI}:443"
 
+        [[ -z "$RELAY_PUBKEY" || -z "$RELAY_SNI" || -z "$RELAY_PRIVKEY" ]] && \
+            log_error "中转机参数不完整，请检查中转机的 xray_zhongzhuan_info.txt"
+        log_info "中转机参数已手动录入"
+        return
+    fi
+
+    log_step "读取中转机配置..."
     local info
-    info=$(run_relay "cat /root/xray_zhongzhuan_info.txt 2>/dev/null || echo 'NOT_FOUND'") || \
-        log_error "无法读取中转机信息，请确认 zhongzhuan.sh 已运行"
-    [[ "$info" == "NOT_FOUND" ]] && \
-        log_error "/root/xray_zhongzhuan_info.txt 不存在，请先在中转机运行 zhongzhuan.sh"
+    info=$(run_relay \
+        "cat /root/xray_zhongzhuan_info.txt 2>/dev/null || echo NOT_FOUND") || \
+        log_error "SSH 执行失败，请检查连接"
+
+    # BUG-N1 修复：先检查 NOT_FOUND / 空内容，再做 IP 比对
+    # 原顺序是先比对 IP 再检查 NOT_FOUND，若 ssh 返回 banner 等杂讯会导致
+    # NOT_FOUND 检测失效，后续解析脏数据使 RELAY_PUBKEY 等关键变量为空
+    [[ "$info" == "NOT_FOUND" || -z "$info" ]] && \
+        log_error "中转机未找到 xray_zhongzhuan_info.txt，请先运行 zhongzhuan.sh"
+
+    # BUG-6 修复：校验读取到的中转机IP与用户输入是否一致（仅在数据有效时做）
+    local info_ip
+    info_ip=$(echo "$info" | grep "^ZHONGZHUAN_IP=" | cut -d= -f2 | tr -d '\r')
+    if [[ -n "$info_ip" && "$info_ip" != "$RELAY_IP" ]]; then
+        log_warn "注意：中转机信息文件中的 IP ($info_ip) 与你输入的 ($RELAY_IP) 不同"
+        echo -e "  这通常是因为中转机有多个 IP 或信息文件未更新，不影响连接"
+    fi
 
     while IFS='=' read -r key val; do
         val=$(echo "$val" | tr -d '\r')
         case "$key" in
-            ZHONGZHUAN_IP)          RELAY_IP_CONFIRMED="$val"   ;;
-            ZHONGZHUAN_PRIVKEY)     RELAY_PRIVKEY="$val"        ;;
-            ZHONGZHUAN_PUBKEY)      RELAY_PUBKEY="$val"         ;;
-            ZHONGZHUAN_SHORT_ID)    RELAY_SHORT_ID="$val"       ;;
-            ZHONGZHUAN_SNI)         RELAY_SNI="$val"            ;;
-            ZHONGZHUAN_DEST)        RELAY_DEST="$val"           ;;
-            ZHONGZHUAN_START_PORT)  RELAY_START_PORT="$val"     ;;
-            ZHONGZHUAN_CONFIG)      RELAY_CONFIG="$val"         ;;
-            ZHONGZHUAN_NODES)       RELAY_NODES="$val"          ;;
-            ZHONGZHUAN_XRAY_BIN)    RELAY_XRAY_BIN="$val"       ;;
+            ZHONGZHUAN_PRIVKEY)     RELAY_PRIVKEY="$val"    ;;
+            ZHONGZHUAN_PUBKEY)      RELAY_PUBKEY="$val"     ;;
+            ZHONGZHUAN_SHORT_ID)    RELAY_SHORT_ID="$val"   ;;
+            ZHONGZHUAN_SNI)         RELAY_SNI="$val"        ;;
+            ZHONGZHUAN_DEST)        RELAY_DEST="$val"       ;;
+            ZHONGZHUAN_START_PORT)  RELAY_START_PORT="$val" ;;
+            ZHONGZHUAN_CONFIG)      RELAY_CONFIG="$val"     ;;
+            ZHONGZHUAN_NODES)       RELAY_NODES="$val"      ;;
+            ZHONGZHUAN_XRAY_BIN)    RELAY_XRAY_BIN="$val"   ;;
         esac
     done <<< "$info"
 
-    log_info "中转机 Reality 公钥: $RELAY_PUBKEY"
-    log_info "中转机 SNI: $RELAY_SNI"
-    log_info "起始端口: $RELAY_START_PORT"
+    [[ -z "$RELAY_PUBKEY" || -z "$RELAY_PRIVKEY" ]] && \
+        log_error "中转机信息不完整，请重新运行 zhongzhuan.sh"
+
+    log_info "中转机公钥: $RELAY_PUBKEY"
+    log_info "中转机 SNI: $RELAY_SNI | 起始端口: $RELAY_START_PORT"
 }
 
 # ── 分配端口 + 生成 UUID ──────────────────────────────────
 allocate_port_and_uuid() {
-    [[ "$AUTH_TYPE" == "manual" ]] && {
-        read -rp "中转机入站端口 [30001]: " RELAY_ASSIGNED_PORT
-        RELAY_ASSIGNED_PORT="${RELAY_ASSIGNED_PORT:-30001}"
-        NEW_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
-        log_info "端口: $RELAY_ASSIGNED_PORT | UUID: $NEW_UUID"
-        return
-    }
-
     log_step "分配中转机端口..."
 
-    # 在中转机上找下一个可用端口
-    RELAY_ASSIGNED_PORT=$(run_relay "python3 -c \"
+    if [[ "$AUTH_TYPE" == "manual" ]]; then
+        read -rp "中转机入站端口 [$RELAY_START_PORT]: " i
+        RELAY_ASSIGNED_PORT="${i:-$RELAY_START_PORT}"
+    else
+        # 在中转机上查找下一个未使用的端口（用 pipe_python_relay 更安全）
+        RELAY_ASSIGNED_PORT=$(echo "
 import json
 try:
     cfg = json.load(open('${RELAY_CONFIG}'))
-    used = {i.get('port') for i in cfg.get('inbounds', [])}
-    start = ${RELAY_START_PORT:-30001}
+    used = {ib.get('port') for ib in cfg.get('inbounds', [])}
+    start = int('${RELAY_START_PORT:-30001}')
     p = start
     while p in used: p += 1
     print(p)
 except Exception as e:
-    print(${RELAY_START_PORT:-30001})
-\"")
-    RELAY_ASSIGNED_PORT=$(echo "$RELAY_ASSIGNED_PORT" | tr -d '[:space:]')
+    import sys
+    print('${RELAY_START_PORT:-30001}')
+" | pipe_python_relay | tr -d '[:space:]')
+    fi
 
-    # 生成新 UUID（本地）
+    [[ "$RELAY_ASSIGNED_PORT" =~ ^[0-9]+$ ]] || \
+        log_error "获取端口失败，返回值: $RELAY_ASSIGNED_PORT"
+
+    # 生成新 UUID（本地生成）
     NEW_UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
 
     log_info "分配端口: $RELAY_ASSIGNED_PORT | 新 UUID: $NEW_UUID"
@@ -224,19 +268,16 @@ except Exception as e:
 
 # ── 更新中转机配置 ────────────────────────────────────────
 update_relay_config() {
-    if [[ "$AUTH_TYPE" == "manual" ]]; then
-        show_manual_commands
-        return
-    fi
-
     log_step "更新中转机 xray-relay 配置..."
 
-    # 本地用 Python 生成完整的远程更新脚本（所有值 JSON 转义后嵌入）
+    # 本地用 python3 生成完整的远程执行脚本
+    # 所有值通过 json.dumps 序列化，避免特殊字符问题
     local REMOTE_SCRIPT
     REMOTE_SCRIPT=$(python3 << PYEOF
 import json
+from datetime import datetime
 
-inbound_tag = "relay-in-${RELAY_ASSIGNED_PORT}"
+inbound_tag  = "relay-in-${RELAY_ASSIGNED_PORT}"
 outbound_tag = "relay-out-${RELAY_ASSIGNED_PORT}"
 
 inbound = {
@@ -305,16 +346,15 @@ node_info = {
     "added_at": "$(date '+%Y-%m-%d %H:%M:%S')"
 }
 
-script = f'''
-import json, sys
+# 生成在中转机上运行的 Python 脚本字符串
+remote = f'''import json, sys
 
-config_path = "${RELAY_CONFIG}"
-nodes_path  = "${RELAY_NODES}"
-
-inbound   = {json.dumps(inbound)}
-outbound  = {json.dumps(outbound)}
-rule      = {json.dumps(rule)}
-node_info = {json.dumps(node_info)}
+config_path = {json.dumps("${RELAY_CONFIG}")}
+nodes_path  = {json.dumps("${RELAY_NODES}")}
+inbound     = {json.dumps(inbound)}
+outbound    = {json.dumps(outbound)}
+rule        = {json.dumps(rule)}
+node_info   = {json.dumps(node_info)}
 
 try:
     with open(config_path) as f:
@@ -323,29 +363,28 @@ except Exception as e:
     print(f"ERROR: 读取配置失败 {{e}}", file=sys.stderr)
     sys.exit(1)
 
-# 幂等：删除同标签的旧规则
+# 幂等：先删除同标签旧规则
 config["inbounds"] = [i for i in config.get("inbounds", [])
                       if i.get("tag") != inbound["tag"]]
 config["outbounds"] = [o for o in config.get("outbounds", [])
-                       if o.get("tag") not in [outbound["tag"], "direct"]]
+                       if o.get("tag") not in (outbound["tag"], "direct")]
 config.setdefault("routing", {{}}).setdefault("rules", [])
 config["routing"]["rules"] = [r for r in config["routing"]["rules"]
                                if inbound["tag"] not in r.get("inboundTag", [])]
 
-# 写入新规则
+# 写入新规则，路由置顶
 config["inbounds"].append(inbound)
 config["outbounds"].insert(0, outbound)
 config["outbounds"].append({{"tag": "direct", "protocol": "freedom"}})
-config["routing"]["rules"].insert(0, rule)   # 路由规则置顶
+config["routing"]["rules"].insert(0, rule)
 
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
-print(f"[✓] 入站/出站/路由规则已写入 (端口 {inbound['port']})")
+print(f"[OK] 入站/出站/路由已写入（端口 {{inbound['port']}}）")
 
 # 更新节点注册表
 try:
-    with open(nodes_path) as f:
-        nodes = json.load(f)
+    nodes = json.load(open(nodes_path))
 except Exception:
     nodes = {{"nodes": []}}
 nodes["nodes"] = [n for n in nodes.get("nodes", [])
@@ -353,100 +392,87 @@ nodes["nodes"] = [n for n in nodes.get("nodes", [])
 nodes["nodes"].append(node_info)
 with open(nodes_path, "w") as f:
     json.dump(nodes, f, indent=2)
-print(f"[✓] 节点注册表已更新 (共 {{len(nodes['nodes'])}} 个节点)")
+print(f"[OK] 节点注册表已更新（共 {{len(nodes['nodes'])}} 个节点）")
 '''
-print(script)
+print(remote)
 PYEOF
 )
 
-    # 发送并执行远程脚本
+    if [[ "$AUTH_TYPE" == "manual" ]]; then
+        echo ""
+        echo -e "${YELLOW}══ 在中转机上执行以下 Python 脚本 ══${NC}"
+        echo ""
+        echo "将以下内容保存为 /tmp/relay_update.py 后运行 python3 /tmp/relay_update.py："
+        echo "────────────────────────────────────────────────────────"
+        echo "$REMOTE_SCRIPT"
+        echo "────────────────────────────────────────────────────────"
+        echo ""
+        log_warn "执行完毕后在中转机运行: systemctl restart xray-relay"
+        echo ""
+        read -rp "已在中转机执行完毕？按回车继续生成节点链接..." _
+        return
+    fi
+
+    # 发送到中转机执行
     local result
     result=$(echo "$REMOTE_SCRIPT" | pipe_python_relay) || \
         log_error "远程配置写入失败，请检查中转机"
     echo "$result" | while read -r line; do log_info "中转机: $line"; done
 
     # 验证配置
-    log_step "验证中转机 xray-relay 配置..."
-    run_relay "${RELAY_XRAY_BIN:-xray} -test -config ${RELAY_CONFIG} >/dev/null 2>&1 && \
-               echo CONFIG_OK || echo CONFIG_FAIL" | grep -q "CONFIG_OK" || {
-        log_warn "配置验证失败，尝试查看错误..."
-        run_relay "${RELAY_XRAY_BIN:-xray} -test -config ${RELAY_CONFIG} 2>&1 | tail -10" || true
+    log_step "验证 xray-relay 配置..."
+    local xray_cmd="${RELAY_XRAY_BIN:-/usr/local/bin/xray}"
+    run_relay \
+        "${xray_cmd} -test -config ${RELAY_CONFIG} >/dev/null 2>&1 \
+         && echo CONFIG_OK || echo CONFIG_FAIL" | grep -q "CONFIG_OK" || {
+        log_warn "配置验证失败，错误信息："
+        run_relay "${xray_cmd} -test -config ${RELAY_CONFIG} 2>&1 | tail -10" \
+            || true
         log_error "xray-relay 配置有误，请检查"
     }
     log_info "配置验证通过"
 
-    # 重启 xray-relay
+    # 重启并确认
     run_relay "systemctl restart xray-relay"
     sleep 2
-
     local status
-    status=$(run_relay "systemctl is-active xray-relay 2>/dev/null || echo inactive")
-    status=$(echo "$status" | tr -d '[:space:]')
-    if [[ "$status" == "active" ]]; then
-        log_info "xray-relay 重启成功，运行正常"
-    else
-        log_error "xray-relay 未能正常启动：run_relay 'journalctl -u xray-relay -n 20'"
-    fi
+    status=$(run_relay \
+        "systemctl is-active xray-relay 2>/dev/null || echo inactive" \
+        | tr -d '[:space:]')
+    [[ "$status" == "active" ]] && \
+        log_info "xray-relay 重启成功，运行正常" || \
+        log_error "xray-relay 未能正常启动，请 SSH 到中转机执行: journalctl -u xray-relay -n 20"
 }
 
 # ── 生成节点链接 ──────────────────────────────────────────
 generate_node_link() {
     log_step "生成节点链接..."
 
-    # 用户使用的节点：连接中转机，流量经中转到落地机出口
-    NODE_LINK="vless://${NEW_UUID}@${RELAY_IP}:${RELAY_ASSIGNED_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${RELAY_SNI}&fp=chrome&pbk=${RELAY_PUBKEY}&sid=${RELAY_SHORT_ID}&type=tcp&headerType=none#${NODE_LABEL}"
+    # 确保必要参数存在（manual模式下已手动输入）
+    [[ -z "$RELAY_PUBKEY" ]]   && log_error "中转机公钥为空，无法生成节点链接"
+    [[ -z "$RELAY_SNI" ]]      && log_error "中转机 SNI 为空，无法生成节点链接"
+
+    NODE_LINK="vless://${NEW_UUID}@${RELAY_IP}:${RELAY_ASSIGNED_PORT}"
+    NODE_LINK+="?encryption=none&flow=xtls-rprx-vision"
+    NODE_LINK+="&security=reality&sni=${RELAY_SNI}"
+    NODE_LINK+="&fp=chrome&pbk=${RELAY_PUBKEY}"
+    NODE_LINK+="&sid=${RELAY_SHORT_ID}"
+    NODE_LINK+="&type=tcp&headerType=none"
+    NODE_LINK+="#${NODE_LABEL}"
     log_info "节点链接已生成"
-}
-
-# ── 显示手动命令（SSH 失败时的降级方案）─────────────────
-show_manual_commands() {
-    echo ""
-    echo -e "${YELLOW}══ 无法自动 SSH，请在中转机手动执行以下 Python 脚本 ══${NC}"
-    echo ""
-    echo -e "在中转机上运行 ${CYAN}python3 /tmp/relay_update.py${NC}"
-    echo ""
-    echo "将以下内容保存为 /tmp/relay_update.py："
-    echo "─────────────────────────────────────────────────"
-    cat << MANUAL_PYEOF
-import json
-
-config_path = "${RELAY_CONFIG:-/usr/local/etc/xray-relay/config.json}"
-nodes_path  = "${RELAY_NODES:-/usr/local/etc/xray-relay/nodes.json}"
-
-# 请替换以下实际值
-relay_privkey   = "请在中转机 /root/xray_zhongzhuan_info.txt 查看 ZHONGZHUAN_PRIVKEY"
-relay_sni       = "请填写 ZHONGZHUAN_SNI"
-relay_short_id  = "请填写 ZHONGZHUAN_SHORT_ID"
-landing_ip      = "${LUODI_IP}"
-landing_port    = ${LUODI_RELAY_PORT}
-landing_uuid    = "${LUODI_UUID}"
-landing_pubkey  = "${LUODI_PUBKEY}"
-landing_sni     = "${LUODI_SNI}"
-landing_sid     = "${LUODI_SHORT_ID}"
-relay_port      = 30001  # 从起始端口依次往后取未使用的
-new_uuid        = "$(python3 -c 'import uuid; print(uuid.uuid4())')"
-
-# 用实际值替换上面后直接运行即可
-# 脚本自动更新 config.json 和 nodes.json 并打印结果
-MANUAL_PYEOF
-    echo "─────────────────────────────────────────────────"
-    echo ""
-    log_warn "完成后在中转机执行: systemctl restart xray-relay"
-    echo ""
 }
 
 # ── 保存结果 ──────────────────────────────────────────────
 save_result() {
-    # 追加节点链接到落地机信息文件
     {
         echo ""
-        echo "── 对接节点链接（$(date '+%Y-%m-%d %H:%M:%S')）────────────────────"
+        echo "── 对接节点链接（$(date '+%Y-%m-%d %H:%M:%S')）──────────────────────"
         echo "RELAY_IP=${RELAY_IP}"
         echo "RELAY_PORT=${RELAY_ASSIGNED_PORT}"
         echo "RELAY_UUID=${NEW_UUID}"
         echo "NODE_LABEL=${NODE_LABEL}"
         echo "NODE_LINK=${NODE_LINK}"
-        echo "──────────────────────────────────────────────────────────"
+        echo "────────────────────────────────────────────────────────────"
     } >> "$LOCAL_INFO"
     log_info "节点链接已追加到: $LOCAL_INFO"
 }
@@ -455,11 +481,11 @@ save_result() {
 print_result() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 对接完成！节点链接如下${NC}                            ${CYAN}║${NC}"
+    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 对接完成  duijie.sh v5.1${NC}                          ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${BOLD}流量路径：${NC}"
-    echo -e "  用户 → 中转机 ${RELAY_IP}:${RELAY_ASSIGNED_PORT} → 落地机 ${LUODI_IP} → 互联网"
+    echo -e "  用户 → ${CYAN}${RELAY_IP}:${RELAY_ASSIGNED_PORT}${NC} → ${LUODI_IP} → 互联网"
     echo ""
     echo -e "  ${BOLD}节点链接：${NC}"
     echo -e "  ${GREEN}${NODE_LINK}${NC}"
@@ -470,20 +496,18 @@ print_result() {
     echo -e "  ${BOLD}节点标签   :${NC} $NODE_LABEL"
     echo ""
     echo -e "${YELLOW}常用命令：${NC}"
-    echo -e "  查看落地机信息   : cat $LOCAL_INFO"
-    echo -e "  查看中转机节点表 : (SSH到中转机) cat $RELAY_NODES | python3 -m json.tool"
-    echo -e "  中转机日志       : (SSH到中转机) journalctl -u xray-relay -f"
+    echo -e "  落地机信息      : cat $LOCAL_INFO"
+    echo -e "  中转机节点列表  : (SSH到中转机) python3 -m json.tool $RELAY_NODES"
+    echo -e "  中转机日志      : (SSH到中转机) journalctl -u xray-relay -f"
     echo ""
 }
 
-# ── 主函数 ────────────────────────────────────────────────
 main() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       落地机对接脚本  duijie.sh  v5.0               ║${NC}"
+    echo -e "${CYAN}║       落地机对接脚本  duijie.sh  v5.1               ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
-
     read_luodi_info
     setup_ssh
     read_relay_info

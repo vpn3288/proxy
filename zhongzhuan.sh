@@ -1,15 +1,16 @@
 #!/bin/bash
 # ============================================================
-# zhongzhuan.sh v5.0 — 中转机初始化脚本
+# zhongzhuan.sh v5.1 — 中转机初始化脚本
 # 功能：安装独立 xray-relay 服务，生成 Reality 密钥
 #       初始化空配置，供 duijie.sh 逐步添加落地机
 # 用法：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/zhongzhuan.sh)
+# 修复：v5.1 重复运行保留密钥/unzip检测/iptables持久化
 # ============================================================
 # 架构说明：
 #   中转机运行两个独立进程：
-#   ① xray.service      — v2ray-agent 管理，中转机自身对外节点（可选）
+#   ① xray.service       — v2ray-agent 管理，中转机自身对外节点
 #   ② xray-relay.service — 本脚本创建，专门处理 用户→中转→落地 流量
-#   两者互不干扰，mack-a 操作不影响 xray-relay
+#   两者完全隔离，mack-a 任何操作不影响 xray-relay
 # ============================================================
 
 set -e
@@ -33,105 +34,207 @@ INFO_FILE="/root/xray_zhongzhuan_info.txt"
 
 XRAY_BIN="" PUBLIC_IP=""
 RELAY_PRIVKEY="" RELAY_PUBKEY="" RELAY_SHORT_ID="" RELAY_SNI=""
+RELAY_DEST=""
 START_PORT="" MAX_NODES=""
+IS_FIRST_RUN=true
 
 # ── 查找或安装 Xray ───────────────────────────────────────
 find_or_install_xray() {
     log_step "查找 Xray 二进制..."
-    for p in /etc/v2ray-agent/xray/xray /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+    for p in /etc/v2ray-agent/xray/xray /usr/local/bin/xray \
+              /usr/bin/xray /opt/xray/xray; do
         [[ -x "$p" ]] && { XRAY_BIN="$p"; log_info "Xray: $XRAY_BIN"; return 0; }
     done
     local w; w=$(command -v xray 2>/dev/null || true)
     [[ -n "$w" ]] && { XRAY_BIN="$w"; log_info "Xray: $XRAY_BIN"; return 0; }
 
     log_warn "未找到 Xray，自动安装..."
-    # 使用官方安装脚本
-    if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
+
+    # BUG-4 修复：确保 unzip 已安装
+    if ! command -v unzip &>/dev/null; then
+        log_step "安装 unzip..."
+        apt-get install -y -qq unzip 2>/dev/null || \
+            log_error "unzip 安装失败，请手动执行: apt-get install -y unzip"
+    fi
+
+    # 官方安装脚本
+    if bash -c "$(curl -fsSL \
+        https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
         @ install 2>/dev/null; then
+        log_info "Xray 官方脚本安装成功"
+    else
         # 备用：手动下载
         log_warn "官方脚本安装失败，尝试手动下载..."
         local arch; arch=$(uname -m)
+        local arch_tag
         case "$arch" in
-            x86_64)  arch="64" ;;
-            aarch64) arch="arm64-v8a" ;;
-            armv7*)  arch="arm32-v7a" ;;
+            x86_64)  arch_tag="64"          ;;
+            aarch64) arch_tag="arm64-v8a"   ;;
+            armv7*)  arch_tag="arm32-v7a"   ;;
             *)       log_error "不支持的架构: $arch" ;;
         esac
-        local VER; VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+        local VER
+        VER=$(curl -s \
+            https://api.github.com/repos/XTLS/Xray-core/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4)
-        [[ -z "$VER" ]] && log_error "无法获取 Xray 版本号，请手动安装 Xray 后重试"
-        local URL="https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-${arch}.zip"
+        [[ -z "$VER" ]] && \
+            log_error "无法获取 Xray 版本号，请手动安装后重试"
+        local URL
+        URL="https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-${arch_tag}.zip"
+        curl -fsSL "$URL" -o /tmp/xray.zip || \
+            log_error "下载失败，请检查网络"
         mkdir -p /usr/local/bin
-        curl -fsSL "$URL" -o /tmp/xray.zip
         unzip -o /tmp/xray.zip xray -d /usr/local/bin/ >/dev/null
         chmod +x /usr/local/bin/xray
         rm -f /tmp/xray.zip
+        log_info "Xray 手动安装完成"
     fi
 
-    XRAY_BIN=$(command -v xray 2>/dev/null || true)
-    [[ -z "$XRAY_BIN" ]] && XRAY_BIN="/usr/local/bin/xray"
+    XRAY_BIN=$(command -v xray 2>/dev/null || echo "/usr/local/bin/xray")
     [[ -x "$XRAY_BIN" ]] || log_error "Xray 安装失败，请手动安装后重试"
-    log_info "Xray 安装完成: $XRAY_BIN ($(${XRAY_BIN} version 2>/dev/null | head -1))"
+    log_info "Xray: $XRAY_BIN ($("$XRAY_BIN" version 2>/dev/null | head -1))"
 }
 
-# ── 生成 Reality 密钥 ─────────────────────────────────────
-generate_relay_keys() {
-    log_step "生成中转机 Reality 密钥..."
+# ── BUG-3 修复：重复运行时保留已有密钥 ───────────────────
+load_or_generate_relay_keys() {
+    log_step "处理 Reality 密钥..."
 
+    # 检查是否已有密钥
+    if [[ -f "$INFO_FILE" ]]; then
+        local saved_privkey saved_pubkey saved_shortid saved_sni
+        while IFS='=' read -r key val; do
+            val=$(echo "$val" | tr -d '\r')
+            case "$key" in
+                ZHONGZHUAN_PRIVKEY)  saved_privkey="$val"  ;;
+                ZHONGZHUAN_PUBKEY)   saved_pubkey="$val"   ;;
+                ZHONGZHUAN_SHORT_ID) saved_shortid="$val"  ;;
+                ZHONGZHUAN_SNI)      saved_sni="$val"      ;;
+            esac
+        done < "$INFO_FILE"
+
+        if [[ -n "$saved_privkey" && -n "$saved_pubkey" ]]; then
+            IS_FIRST_RUN=false
+            echo ""
+            echo -e "${YELLOW}══ 检测到已有中转机密钥 ══${NC}"
+            echo -e "  公钥: $saved_pubkey"
+            echo -e "  SNI : $saved_sni"
+            echo ""
+            echo -e "${RED}警告：重新生成密钥将导致所有已对接节点链接全部失效！${NC}"
+            echo -e "  已对接的节点需要重新运行 duijie.sh 才能恢复。"
+            echo ""
+            read -rp "保留已有密钥（强烈建议）？[Y/n]: " yn
+            if [[ "${yn,,}" != "n" ]]; then
+                RELAY_PRIVKEY="$saved_privkey"
+                RELAY_PUBKEY="$saved_pubkey"
+                RELAY_SHORT_ID="$saved_shortid"
+                RELAY_SNI="$saved_sni"
+                log_info "已保留现有密钥，现有节点链接继续有效"
+                return 0
+            fi
+            log_warn "已选择重新生成密钥，所有现有节点链接将失效"
+        fi
+    fi
+
+    # 生成新密钥
+    log_step "生成中转机 Reality 密钥..."
     local key_out
     key_out=$("$XRAY_BIN" x25519 2>&1)
-    # 兼容 v24（Private key:/Public key:）和 v26（Private:/Password:）
+
+    # 兼容 Xray v24 和 v26+ 的不同输出格式
     RELAY_PRIVKEY=$(echo "$key_out" | grep -iE "^Private" \
         | awk '{print $NF}' | tr -d '[:space:]' | head -1)
     RELAY_PUBKEY=$(echo "$key_out" | grep -iE "^(Public key|Password)" \
         | awk '{print $NF}' | tr -d '[:space:]' | head -1)
-    [[ -z "$RELAY_PRIVKEY" ]] && {
+    # 纯两行格式兜底
+    if [[ -z "$RELAY_PRIVKEY" ]]; then
         RELAY_PRIVKEY=$(echo "$key_out" | awk 'NR==1{print $NF}')
         RELAY_PUBKEY=$(echo  "$key_out" | awk 'NR==2{print $NF}')
-    }
+    fi
     [[ -z "$RELAY_PRIVKEY" || -z "$RELAY_PUBKEY" ]] && \
         log_error "密钥生成失败，输出:\n$key_out"
 
-    # 生成 Short ID（随机 8 位 hex）
+    # 随机 8 位 Short ID
     RELAY_SHORT_ID=$(openssl rand -hex 4 2>/dev/null || \
         python3 -c "import secrets; print(secrets.token_hex(4))")
 
-    log_info "公钥 (pubkey): $RELAY_PUBKEY"
-    log_info "Short ID     : $RELAY_SHORT_ID"
+    log_info "公钥 : $RELAY_PUBKEY"
+    log_info "ShortID: $RELAY_SHORT_ID"
 }
 
 # ── 选择 SNI ──────────────────────────────────────────────
 choose_relay_sni() {
+    # 如果已有 SNI 且保留了密钥，直接跳过
+    if [[ -n "$RELAY_SNI" && "$IS_FIRST_RUN" == "false" ]]; then
+        log_info "保留已有 SNI: $RELAY_SNI"
+        RELAY_DEST="${RELAY_SNI}:443"
+        return
+    fi
+
     echo ""
     echo -e "${YELLOW}── 中转机 Reality 伪装域名 ──${NC}"
-    echo "  用于用户连接时的 TLS 伪装，选一个你喜欢的域名"
-    echo "  常用选项：www.microsoft.com / www.apple.com / www.cloudflare.com"
+    echo "  推荐：www.microsoft.com / www.apple.com / www.cloudflare.com"
     echo ""
     read -rp "SNI [回车使用 www.microsoft.com]: " i
     RELAY_SNI="${i:-www.microsoft.com}"
+    RELAY_DEST="${RELAY_SNI}:443"
     log_info "SNI: $RELAY_SNI"
 }
 
 # ── 获取公网 IP ───────────────────────────────────────────
 get_public_ip() {
     log_step "获取公网 IP..."
-    PUBLIC_IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null ||
-                curl -s4 --connect-timeout 5 https://ifconfig.me   2>/dev/null ||
-                curl -s4 --connect-timeout 5 https://icanhazip.com 2>/dev/null || echo "unknown")
+    PUBLIC_IP=$(
+        curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null ||
+        curl -s4 --connect-timeout 5 https://ifconfig.me   2>/dev/null ||
+        curl -s4 --connect-timeout 5 https://icanhazip.com 2>/dev/null ||
+        echo ""
+    )
     PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
-    read -rp "中转机公网 IP [回车使用 $PUBLIC_IP]: " i; [[ -n "$i" ]] && PUBLIC_IP="$i"
+
+    # BUG-Z1 修复：curl 全部超时时 PUBLIC_IP 为空，强制手动输入
+    # 原 "unknown" 兜底会导致节点链接服务器地址为 "unknown"，完全不可用
+    if [[ -z "$PUBLIC_IP" ]]; then
+        log_warn "自动获取公网 IP 失败（网络不通或被限制）"
+        while true; do
+            read -rp "请手动输入中转机公网 IP: " PUBLIC_IP
+            [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && break
+            log_warn "IP 格式不正确，请重新输入（示例：1.2.3.4）"
+        done
+    else
+        read -rp "中转机公网 IP [回车使用 $PUBLIC_IP]: " i
+        [[ -n "$i" ]] && PUBLIC_IP="$i"
+    fi
     log_info "IP: $PUBLIC_IP"
 }
 
-# ── 配置参数 ──────────────────────────────────────────────
+# ── 配置端口 ──────────────────────────────────────────────
 get_user_config() {
+    # 重复运行时保留已有端口配置
+    if [[ "$IS_FIRST_RUN" == "false" ]]; then
+        local saved_start saved_max
+        while IFS='=' read -r key val; do
+            val=$(echo "$val" | tr -d '\r')
+            case "$key" in
+                ZHONGZHUAN_START_PORT) saved_start="$val" ;;
+                ZHONGZHUAN_MAX_NODES)  saved_max="$val"   ;;
+            esac
+        done < "$INFO_FILE"
+        if [[ -n "$saved_start" && -n "$saved_max" ]]; then
+            START_PORT="$saved_start"
+            MAX_NODES="$saved_max"
+            log_info "保留端口配置: $START_PORT ~ $(( START_PORT + MAX_NODES - 1 ))"
+            return
+        fi
+    fi
+
     echo ""
     echo -e "${YELLOW}── 端口规划 ──${NC}"
 
     while true; do
         read -rp "计划对接几台落地机 (1-50) [默认 10]: " i
         MAX_NODES="${i:-10}"
-        [[ "$MAX_NODES" =~ ^[0-9]+$ ]] && (( MAX_NODES >= 1 && MAX_NODES <= 50 )) && break
+        [[ "$MAX_NODES" =~ ^[0-9]+$ ]] && \
+            (( MAX_NODES >= 1 && MAX_NODES <= 50 )) && break
         log_warn "请输入 1-50 之间的数字"
     done
 
@@ -154,7 +257,7 @@ init_xray_relay_service() {
 
     mkdir -p "$RELAY_CONF_DIR" "$RELAY_LOG_DIR"
 
-    # 初始化空配置（如已存在则保留）
+    # 初始化配置（已存在则保留）
     if [[ ! -f "$RELAY_CONFIG" ]]; then
         cat > "$RELAY_CONFIG" << 'JSONEOF'
 {
@@ -175,7 +278,6 @@ init_xray_relay_service() {
 JSONEOF
         log_info "初始化空配置: $RELAY_CONFIG"
     else
-        log_warn "配置文件已存在，保留已有节点记录"
         local node_count
         node_count=$(python3 -c "
 import json
@@ -183,16 +285,16 @@ try:
     c = json.load(open('$RELAY_CONFIG'))
     print(len(c.get('inbounds', [])))
 except: print(0)" 2>/dev/null || echo 0)
-        log_info "当前已配置 $node_count 个落地节点"
+        log_info "配置已存在，当前已对接 $node_count 台落地机，保留不变"
     fi
 
     # 初始化节点注册表
-    if [[ ! -f "$RELAY_NODES" ]]; then
+    [[ ! -f "$RELAY_NODES" ]] && {
         echo '{"nodes":[]}' > "$RELAY_NODES"
         log_info "初始化节点注册表: $RELAY_NODES"
-    fi
+    }
 
-    # 写入 systemd 服务文件
+    # 写入 systemd 服务文件（每次都更新，确保 XRAY_BIN 路径正确）
     cat > "$RELAY_SERVICE" << EOF
 [Unit]
 Description=Xray Relay Service
@@ -202,7 +304,7 @@ After=network.target nss-lookup.target
 [Service]
 Type=simple
 User=root
-ExecStart=${XRAY_BIN} run -config ${RELAY_CONFIG}
+ExecStart="${XRAY_BIN}" run -config "${RELAY_CONFIG}"
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
@@ -218,10 +320,32 @@ EOF
     sleep 2
 
     if systemctl is-active --quiet xray-relay; then
-        log_info "xray-relay 服务已启动"
+        log_info "xray-relay 服务运行正常"
     else
         log_error "xray-relay 启动失败：journalctl -u xray-relay -n 20"
     fi
+}
+
+# ── iptables 持久化 ───────────────────────────────────────
+ensure_iptables_persistent() {
+    if ! command -v netfilter-persistent &>/dev/null && \
+       ! dpkg -l iptables-persistent &>/dev/null 2>&1; then
+        log_step "安装 iptables-persistent..."
+        echo iptables-persistent iptables-persistent/autosave_v4 boolean true | \
+            debconf-set-selections 2>/dev/null || true
+        echo iptables-persistent iptables-persistent/autosave_v6 boolean false | \
+            debconf-set-selections 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            iptables-persistent netfilter-persistent 2>/dev/null || \
+            log_warn "iptables-persistent 安装失败，规则可能在重启后丢失"
+    fi
+}
+
+save_iptables() {
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    command -v netfilter-persistent &>/dev/null && \
+        netfilter-persistent save >/dev/null 2>&1 || true
 }
 
 # ── 开放防火墙端口 ────────────────────────────────────────
@@ -230,20 +354,22 @@ open_firewall_ports() {
     echo ""
     read -rp "自动开放防火墙 TCP ${START_PORT}~${end_port}？[Y/n]: " yn
     [[ "${yn,,}" == "n" ]] && {
-        log_warn "跳过防火墙配置，请手动在安全组放行 TCP $START_PORT~$end_port"
+        log_warn "跳过防火墙，请手动放行 TCP $START_PORT~$end_port"
         return
     }
 
+    ensure_iptables_persistent
+
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
         ufw allow "${START_PORT}:${end_port}/tcp" >/dev/null 2>&1 && \
-            log_info "ufw 已放行 TCP ${START_PORT}~${end_port}" || \
+            log_info "ufw 已放行 TCP $START_PORT~$end_port" || \
             log_warn "ufw 操作失败，请手动放行"
     elif command -v iptables &>/dev/null; then
-        iptables -I INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT 2>/dev/null && \
-            log_info "iptables 已放行 TCP ${START_PORT}~${end_port}" || \
+        iptables -I INPUT -p tcp --dport "${START_PORT}:${end_port}" \
+            -j ACCEPT 2>/dev/null && \
+            log_info "iptables 已放行 TCP $START_PORT~$end_port" || \
             log_warn "iptables 操作失败，请手动放行"
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        save_iptables
     else
         log_warn "未检测到防火墙工具，请手动在安全组放行 TCP $START_PORT~$end_port"
     fi
@@ -261,7 +387,7 @@ ZHONGZHUAN_PRIVKEY=${RELAY_PRIVKEY}
 ZHONGZHUAN_PUBKEY=${RELAY_PUBKEY}
 ZHONGZHUAN_SHORT_ID=${RELAY_SHORT_ID}
 ZHONGZHUAN_SNI=${RELAY_SNI}
-ZHONGZHUAN_DEST=${RELAY_SNI}:443
+ZHONGZHUAN_DEST=${RELAY_DEST}
 ZHONGZHUAN_START_PORT=${START_PORT}
 ZHONGZHUAN_MAX_NODES=${MAX_NODES}
 ZHONGZHUAN_CONF_DIR=${RELAY_CONF_DIR}
@@ -273,7 +399,7 @@ ZHONGZHUAN_XRAY_BIN=${XRAY_BIN}
 预留端口: ${START_PORT} ~ ${end_port}（共 ${MAX_NODES} 个）
 
 ── 管理命令 ──────────────────────────────────────────────
-查看节点列表    : python3 -m json.tool ${RELAY_NODES}
+查看已对接节点  : python3 -m json.tool ${RELAY_NODES}
 查看中转配置    : python3 -m json.tool ${RELAY_CONFIG}
 重启 xray-relay : systemctl restart xray-relay
 查看运行状态    : systemctl status xray-relay
@@ -288,7 +414,7 @@ print_result() {
     local end_port=$(( START_PORT + MAX_NODES - 1 ))
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 中转机初始化完成${NC}                                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 中转机初始化完成  zhongzhuan.sh v5.1${NC}              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${BOLD}中转机 IP     :${NC} $PUBLIC_IP"
@@ -298,21 +424,18 @@ print_result() {
     echo -e "  ${BOLD}端口范围      :${NC} $START_PORT ~ $end_port"
     echo -e "  ${BOLD}xray-relay    :${NC} $(systemctl is-active xray-relay 2>/dev/null)"
     echo ""
-    echo -e "${YELLOW}下一步：${NC}"
-    echo -e "  在每台落地机上依次运行："
-    echo -e "  1. ${CYAN}bash luodi.sh${NC}  — 落地机配置"
-    echo -e "  2. ${CYAN}bash duijie.sh${NC} — 对接中转机（SSH 到中转机自动写入）"
+    echo -e "${YELLOW}下一步：在每台落地机上运行 luodi.sh → duijie.sh${NC}"
     echo ""
 }
 
 main() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       中转机初始化脚本  zhongzhuan.sh  v5.0         ║${NC}"
+    echo -e "${CYAN}║       中转机初始化脚本  zhongzhuan.sh  v5.1         ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     find_or_install_xray
-    generate_relay_keys
+    load_or_generate_relay_keys   # BUG-3 修复：保留已有密钥
     choose_relay_sni
     get_public_ip
     get_user_config

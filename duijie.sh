@@ -18,7 +18,7 @@
 #   - 新增连通性验证提示
 # ============================================================
 
-set -euo pipefail
+set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -173,30 +173,30 @@ PYEOF
     [[ -z "$transport_json" ]] && transport_json='{"network":"tcp"}'
 
     LUODI_NETWORK=$(echo "$transport_json" | python3 -c \
-        "import json,sys; print(json.load(sys.stdin).get('network','tcp'))" 2>/dev/null || echo "tcp")
+        "import json,sys; print(json.load(sys.stdin).get('network','tcp'))" 2>/dev/null) || LUODI_NETWORK="tcp"
 
     _get() { echo "$transport_json" | python3 -c \
-        "import json,sys; print(json.load(sys.stdin).get('$1','$2'))" 2>/dev/null || echo "$2"; }
+        "import json,sys; print(json.load(sys.stdin).get('$1','$2'))" 2>/dev/null || echo "$2"; } || true
 
     case "$LUODI_NETWORK" in
         xhttp)
-            LUODI_XHTTP_PATH=$(_get xhttp_path "/")
-            LUODI_XHTTP_HOST=$(_get xhttp_host "")
-            LUODI_XHTTP_MODE=$(_get xhttp_mode "auto")
+            LUODI_XHTTP_PATH=$(_get xhttp_path "/") || true
+            LUODI_XHTTP_HOST=$(_get xhttp_host "") || true
+            LUODI_XHTTP_MODE=$(_get xhttp_mode "auto") || true
             log_info "传输协议: xhttp | path=${LUODI_XHTTP_PATH} | host=${LUODI_XHTTP_HOST} | mode=${LUODI_XHTTP_MODE}"
             ;;
         ws)
-            LUODI_WS_PATH=$(_get ws_path "/")
-            LUODI_WS_HOST=$(_get ws_host "")
+            LUODI_WS_PATH=$(_get ws_path "/") || true
+            LUODI_WS_HOST=$(_get ws_host "") || true
             log_info "传输协议: ws | path=${LUODI_WS_PATH} | host=${LUODI_WS_HOST}"
             ;;
         grpc)
-            LUODI_GRPC_SERVICE=$(_get grpc_service "")
+            LUODI_GRPC_SERVICE=$(_get grpc_service "") || true
             log_info "传输协议: grpc | serviceName=${LUODI_GRPC_SERVICE}"
             ;;
         h2)
-            LUODI_H2_PATH=$(_get h2_path "/")
-            LUODI_H2_HOST=$(_get h2_host "")
+            LUODI_H2_PATH=$(_get h2_path "/") || true
+            LUODI_H2_HOST=$(_get h2_host "") || true
             log_info "传输协议: h2 | path=${LUODI_H2_PATH} | host=${LUODI_H2_HOST}"
             ;;
         tcp)

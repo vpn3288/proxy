@@ -81,6 +81,9 @@ bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/l
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/duijie.sh)
 ```
+```bash
+curl -o /tmp/duijie.sh https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/duijie.sh && bash /tmp/duijie.sh
+```
 
 脚本将：
 - 读取落地机信息（`/root/xray_luodi_info.txt`）

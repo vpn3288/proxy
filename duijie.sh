@@ -351,10 +351,10 @@ remote = f'''import json, sys
 
 config_path = {json.dumps("${RELAY_CONFIG}")}
 nodes_path  = {json.dumps("${RELAY_NODES}")}
-inbound     = {json.dumps(inbound)}
-outbound    = {json.dumps(outbound)}
-rule        = {json.dumps(rule)}
-node_info   = {json.dumps(node_info)}
+inbound     = json.loads({json.dumps(json.dumps(inbound))})
+outbound    = json.loads({json.dumps(json.dumps(outbound))})
+rule        = json.loads({json.dumps(json.dumps(rule))})
+node_info   = json.loads({json.dumps(json.dumps(node_info))})
 
 try:
     with open(config_path) as f:

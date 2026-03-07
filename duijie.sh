@@ -615,14 +615,32 @@ except Exception as e:
     print(f"ERROR: 读取配置失败 {{e}}", file=sys.stderr)
     sys.exit(1)
 
-# 幂等：先删除同标签旧规则
-config["inbounds"] = [i for i in config.get("inbounds", [])
-                      if i.get("tag") != inbound["tag"]]
+# 同一落地机去重：找出所有指向相同 landing_ip+landing_port 的旧 outbound tag
+landing_addr = outbound["settings"]["vnext"][0]["address"]
+landing_port = outbound["settings"]["vnext"][0]["port"]
+old_out_tags = {{
+    o["tag"] for o in config.get("outbounds", [])
+    if o.get("protocol") == "vless"
+    and o.get("settings", {{}}).get("vnext", [{{}}])[0].get("address") == landing_addr
+    and o.get("settings", {{}}).get("vnext", [{{}}])[0].get("port") == landing_port
+}}
+# 找出对应这些 outbound tag 的所有 inbound tag（通过路由规则反查）
+old_in_tags = set()
+for r in config.get("routing", {{}}).get("rules", []):
+    if r.get("outboundTag") in old_out_tags:
+        old_in_tags.update(r.get("inboundTag", []))
+removed = len(old_in_tags)
+
+# 删除旧条目
+config["inbounds"]  = [i for i in config.get("inbounds", [])
+                        if i.get("tag") not in old_in_tags]
 config["outbounds"] = [o for o in config.get("outbounds", [])
-                       if o.get("tag") not in (outbound["tag"], "direct")]
+                        if o.get("tag") not in old_out_tags and o.get("tag") != "direct"]
 config.setdefault("routing", {{}}).setdefault("rules", [])
 config["routing"]["rules"] = [r for r in config["routing"]["rules"]
-                               if inbound["tag"] not in r.get("inboundTag", [])]
+                               if r.get("outboundTag") not in old_out_tags]
+if removed:
+    print(f"[OK] 已清除该落地机旧记录 {{removed}} 条")
 
 # 写入新规则，路由置顶
 config["inbounds"].append(inbound)
@@ -641,8 +659,10 @@ try:
         nodes = json.load(f)
 except Exception:
     nodes = {{"nodes": []}}
+# 同一落地机去重：删除所有指向相同 landing_ip+landing_port 的旧节点
 nodes["nodes"] = [n for n in nodes.get("nodes", [])
-                  if n.get("tag") != node_info["tag"]]
+                  if not (n.get("landing_ip") == node_info["landing_ip"]
+                          and n.get("landing_port") == node_info["landing_port"])]
 nodes["nodes"].append(node_info)
 with open(nodes_path, "w") as f:
     json.dump(nodes, f, indent=2, ensure_ascii=False)
@@ -733,8 +753,36 @@ generate_node_link() {
     log_info "节点链接已生成"
 }
 
-# ── 保存结果 ──────────────────────────────────────────────
+# ── 保存结果（同一落地机只保留最后一条）────────────────────
 save_result() {
+    # 用 python3 清理 LOCAL_INFO 中相同落地机 IP+Port 的旧对接记录，再追加新记录
+    python3 << PYEOF
+import re, os
+
+info_path    = "${LOCAL_INFO}"
+landing_ip   = "${LUODI_IP}"
+landing_port = "${LUODI_PORT}"
+
+if not os.path.exists(info_path):
+    open(info_path, "w").close()
+
+with open(info_path) as f:
+    text = f.read()
+
+# 每条对接记录以 "── 对接节点链接" 开头，以 "────...────" 结尾
+# 删除所有 LANDING_IP 和 LANDING_PORT 匹配的旧记录块
+pattern = r'\n── 对接节点链接[^\n]*\n(?:.*\n)*?.*LANDING_IP=' + re.escape(landing_ip) + r'\n.*LANDING_PORT=' + re.escape(landing_port) + r'\n(?:.*\n)*?─{20,}[─]*'
+cleaned = re.sub(pattern, '', text)
+
+# 也处理旧格式（没有 LANDING_IP 字段的旧记录，通过 NODE_LINK 里的落地 IP 匹配）
+# 旧格式块：匹配包含该落地 IP 的整段对接记录
+pattern2 = r'\n── 对接节点链接[^\n]*\n(?:[^\n]*\n){0,10}[^\n]*' + re.escape(landing_ip) + r'[^\n]*\n(?:[^\n]*\n){0,5}─{20,}[─]*'
+cleaned = re.sub(pattern2, '', cleaned)
+
+with open(info_path, "w") as f:
+    f.write(cleaned)
+PYEOF
+
     {
         echo ""
         echo "── 对接节点链接（$(date '+%Y-%m-%d %H:%M:%S')）──────────────────────"
@@ -748,7 +796,7 @@ save_result() {
         echo "NODE_LINK=${NODE_LINK}"
         echo "────────────────────────────────────────────────────────────"
     } >> "$LOCAL_INFO"
-    log_info "节点链接已追加到: $LOCAL_INFO"
+    log_info "节点链接已追加到: $LOCAL_INFO（旧记录已清理）"
 }
 
 # ── 打印结果 ──────────────────────────────────────────────

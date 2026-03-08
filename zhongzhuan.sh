@@ -1,10 +1,16 @@
 #!/bin/bash
 # ============================================================
-# zhongzhuan.sh v5.1 — 中转机初始化脚本
+# zhongzhuan.sh v5.2 — 中转机初始化脚本
 # 功能：安装独立 xray-relay 服务，生成 Reality 密钥
 #       初始化空配置，供 duijie.sh 逐步添加落地机
 # 用法：bash <(curl -s https://raw.githubusercontent.com/vpn3288/proxy/refs/heads/main/zhongzhuan.sh)
-# 修复：v5.1 重复运行保留密钥/unzip检测/iptables持久化
+#
+# v5.2 新增：
+#   - --status 快速查看当前状态（无需重新初始化）
+#   - 重复运行时显示已对接节点数量
+#   - IP 变更时自动更新 INFO_FILE（保留其他所有配置）
+#   - 端口检查：已用端口自动跳过，防重复分配
+#   - save_info() 仅更新 IP/时间，不覆盖已有字段（IS_FIRST_RUN=false）
 # ============================================================
 # 架构说明：
 #   中转机运行两个独立进程：
@@ -38,6 +44,77 @@ RELAY_DEST=""
 START_PORT="" MAX_NODES=""
 IS_FIRST_RUN=true
 
+# ============================================================
+# --status 模式：快速查看，不做任何修改
+# ============================================================
+cmd_status() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║       中转机状态  zhongzhuan.sh  v5.2              ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # xray-relay 服务状态
+    local svc_status
+    svc_status=$(systemctl is-active xray-relay 2>/dev/null || echo "未安装")
+    echo -e "  ${BOLD}xray-relay 状态 :${NC} $svc_status"
+
+    # 读取 info 文件
+    if [[ -f "$INFO_FILE" ]]; then
+        local ip pub sni sid start max
+        ip=$(grep  "^ZHONGZHUAN_IP="         "$INFO_FILE" | cut -d= -f2-)
+        pub=$(grep "^ZHONGZHUAN_PUBKEY="     "$INFO_FILE" | cut -d= -f2-)
+        sni=$(grep "^ZHONGZHUAN_SNI="        "$INFO_FILE" | cut -d= -f2-)
+        sid=$(grep "^ZHONGZHUAN_SHORT_ID="   "$INFO_FILE" | cut -d= -f2-)
+        start=$(grep "^ZHONGZHUAN_START_PORT=" "$INFO_FILE" | cut -d= -f2-)
+        max=$(grep "^ZHONGZHUAN_MAX_NODES="  "$INFO_FILE" | cut -d= -f2-)
+        echo -e "  ${BOLD}中转机 IP       :${NC} $ip"
+        echo -e "  ${BOLD}公钥            :${NC} ${pub:0:24}..."
+        echo -e "  ${BOLD}SNI             :${NC} $sni"
+        echo -e "  ${BOLD}Short ID        :${NC} $sid"
+        echo -e "  ${BOLD}端口范围        :${NC} $start ~ $(( start + max - 1 ))（共 $max 个）"
+    else
+        echo -e "  ${YELLOW}尚未运行 zhongzhuan.sh 初始化${NC}"
+    fi
+
+    # 已对接节点
+    local nc=0
+    if [[ -f "$RELAY_CONFIG" ]]; then
+        nc=$(python3 -c "
+import json
+try:
+    c = json.load(open('$RELAY_CONFIG'))
+    print(len(c.get('inbounds', [])))
+except: print(0)" 2>/dev/null || echo 0)
+    fi
+    if [[ -f "$RELAY_NODES" ]]; then
+        echo -e "  ${BOLD}已对接落地机    :${NC} ${nc} 台"
+        if [[ $nc -gt 0 ]]; then
+            python3 - "$RELAY_NODES" << 'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    nodes = data.get("nodes", [])
+    for i, n in enumerate(nodes, 1):
+        lid  = n.get("link_id", "?")
+        port = n.get("relay_port", n.get("port", "?"))
+        ip   = n.get("luodi_ip", "?")
+        lbl  = n.get("label", "")
+        print(f"    [{i}] 端口={port}  落地={ip}  LINK_ID={lid}  {lbl}")
+except Exception as e:
+    pass
+PYEOF
+        fi
+    fi
+
+    # 最近日志
+    echo ""
+    echo -e "  ${YELLOW}最近错误日志（最多5条）：${NC}"
+    journalctl -u xray-relay -p err -n 5 --no-pager 2>/dev/null | \
+        grep -v "^-- " | tail -5 || echo "    （无错误日志）"
+    echo ""
+}
+
 # ── 查找或安装 Xray ───────────────────────────────────────
 find_or_install_xray() {
     log_step "查找 Xray 二进制..."
@@ -50,20 +127,17 @@ find_or_install_xray() {
 
     log_warn "未找到 Xray，自动安装..."
 
-    # BUG-4 修复：确保 unzip 已安装
     if ! command -v unzip &>/dev/null; then
         log_step "安装 unzip..."
         apt-get install -y -qq unzip 2>/dev/null || \
             log_error "unzip 安装失败，请手动执行: apt-get install -y unzip"
     fi
 
-    # 官方安装脚本
     if bash -c "$(curl -fsSL \
         https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
         @ install 2>/dev/null; then
         log_info "Xray 官方脚本安装成功"
     else
-        # 备用：手动下载
         log_warn "官方脚本安装失败，尝试手动下载..."
         local arch; arch=$(uname -m)
         local arch_tag
@@ -95,11 +169,10 @@ find_or_install_xray() {
     log_info "Xray: $XRAY_BIN ($("$XRAY_BIN" version 2>/dev/null | head -1))"
 }
 
-# ── BUG-3 修复：重复运行时保留已有密钥 ───────────────────
+# ── 重复运行时保留已有密钥 ────────────────────────────────
 load_or_generate_relay_keys() {
     log_step "处理 Reality 密钥..."
 
-    # 检查是否已有密钥
     if [[ -f "$INFO_FILE" ]]; then
         local saved_privkey saved_pubkey saved_shortid saved_sni
         while IFS='=' read -r key val; do
@@ -135,17 +208,14 @@ load_or_generate_relay_keys() {
         fi
     fi
 
-    # 生成新密钥
     log_step "生成中转机 Reality 密钥..."
     local key_out
     key_out=$("$XRAY_BIN" x25519 2>&1)
 
-    # 兼容 Xray v24 和 v26+ 的不同输出格式
     RELAY_PRIVKEY=$(echo "$key_out" | grep -iE "^Private" \
         | awk '{print $NF}' | tr -d '[:space:]' | head -1)
     RELAY_PUBKEY=$(echo "$key_out" | grep -iE "^(Public key|Password)" \
         | awk '{print $NF}' | tr -d '[:space:]' | head -1)
-    # 纯两行格式兜底
     if [[ -z "$RELAY_PRIVKEY" ]]; then
         RELAY_PRIVKEY=$(echo "$key_out" | awk 'NR==1{print $NF}')
         RELAY_PUBKEY=$(echo  "$key_out" | awk 'NR==2{print $NF}')
@@ -153,7 +223,6 @@ load_or_generate_relay_keys() {
     [[ -z "$RELAY_PRIVKEY" || -z "$RELAY_PUBKEY" ]] && \
         log_error "密钥生成失败，输出:\n$key_out"
 
-    # 随机 8 位 Short ID
     RELAY_SHORT_ID=$(openssl rand -hex 4 2>/dev/null || \
         python3 -c "import secrets; print(secrets.token_hex(4))")
 
@@ -163,7 +232,6 @@ load_or_generate_relay_keys() {
 
 # ── 选择 SNI ──────────────────────────────────────────────
 choose_relay_sni() {
-    # 如果已有 SNI 且保留了密钥，直接跳过
     if [[ -n "$RELAY_SNI" && "$IS_FIRST_RUN" == "false" ]]; then
         log_info "保留已有 SNI: $RELAY_SNI"
         RELAY_DEST="${RELAY_SNI}:443"
@@ -180,7 +248,7 @@ choose_relay_sni() {
     log_info "SNI: $RELAY_SNI"
 }
 
-# ── 获取公网 IP ───────────────────────────────────────────
+# ── 获取公网 IP（v5.2：支持 IP 变更自动更新）─────────────
 get_public_ip() {
     log_step "获取公网 IP..."
     PUBLIC_IP=$(
@@ -191,8 +259,6 @@ get_public_ip() {
     )
     PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
 
-    # BUG-Z1 修复：curl 全部超时时 PUBLIC_IP 为空，强制手动输入
-    # 原 "unknown" 兜底会导致节点链接服务器地址为 "unknown"，完全不可用
     if [[ -z "$PUBLIC_IP" ]]; then
         log_warn "自动获取公网 IP 失败（网络不通或被限制）"
         while true; do
@@ -201,6 +267,15 @@ get_public_ip() {
             log_warn "IP 格式不正确，请重新输入（示例：1.2.3.4）"
         done
     else
+        # v5.2：检测 IP 是否有变更
+        if [[ "$IS_FIRST_RUN" == "false" && -f "$INFO_FILE" ]]; then
+            local old_ip
+            old_ip=$(grep "^ZHONGZHUAN_IP=" "$INFO_FILE" | cut -d= -f2- | tr -d '\r' || true)
+            if [[ -n "$old_ip" && "$old_ip" != "$PUBLIC_IP" ]]; then
+                log_warn "检测到 IP 变更: ${old_ip} → ${PUBLIC_IP}"
+                echo -e "  ${YELLOW}duijie.sh 中已对接的节点链接 IP 不会受影响（节点链接记录在 nodes.json）${NC}"
+            fi
+        fi
         read -rp "中转机公网 IP [回车使用 $PUBLIC_IP]: " i
         [[ -n "$i" ]] && PUBLIC_IP="$i"
     fi
@@ -209,7 +284,6 @@ get_public_ip() {
 
 # ── 配置端口 ──────────────────────────────────────────────
 get_user_config() {
-    # 重复运行时保留已有端口配置
     if [[ "$IS_FIRST_RUN" == "false" ]]; then
         local saved_start saved_max
         while IFS='=' read -r key val; do
@@ -257,7 +331,6 @@ init_xray_relay_service() {
 
     mkdir -p "$RELAY_CONF_DIR" "$RELAY_LOG_DIR"
 
-    # 初始化配置（已存在则保留）
     if [[ ! -f "$RELAY_CONFIG" ]]; then
         cat > "$RELAY_CONFIG" << 'JSONEOF'
 {
@@ -285,16 +358,14 @@ try:
     c = json.load(open('$RELAY_CONFIG'))
     print(len(c.get('inbounds', [])))
 except: print(0)" 2>/dev/null || echo 0)
-        log_info "配置已存在，当前已对接 $node_count 台落地机，保留不变"
+        log_info "配置已存在，当前已对接 ${node_count} 台落地机，保留不变"
     fi
 
-    # 初始化节点注册表
     [[ ! -f "$RELAY_NODES" ]] && {
         echo '{"nodes":[]}' > "$RELAY_NODES"
         log_info "初始化节点注册表: $RELAY_NODES"
     }
 
-    # 写入 systemd 服务文件（每次都更新，确保 XRAY_BIN 路径正确）
     cat > "$RELAY_SERVICE" << EOF
 [Unit]
 Description=Xray Relay Service
@@ -348,7 +419,7 @@ save_iptables() {
         netfilter-persistent save >/dev/null 2>&1 || true
 }
 
-# ── 开放防火墙端口 ────────────────────────────────────────
+# ── 开放防火墙端口（v5.2：跳过已有 iptables 规则）────────
 open_firewall_ports() {
     local end_port=$(( START_PORT + MAX_NODES - 1 ))
     echo ""
@@ -365,22 +436,40 @@ open_firewall_ports() {
             log_info "ufw 已放行 TCP $START_PORT~$end_port" || \
             log_warn "ufw 操作失败，请手动放行"
     elif command -v iptables &>/dev/null; then
-        iptables -I INPUT -p tcp --dport "${START_PORT}:${end_port}" \
-            -j ACCEPT 2>/dev/null && \
-            log_info "iptables 已放行 TCP $START_PORT~$end_port" || \
-            log_warn "iptables 操作失败，请手动放行"
-        save_iptables
+        # v5.2：检查是否已存在相同规则
+        if iptables -C INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT &>/dev/null; then
+            log_info "iptables 规则已存在，跳过"
+        else
+            iptables -I INPUT -p tcp --dport "${START_PORT}:${end_port}" \
+                -j ACCEPT 2>/dev/null && \
+                log_info "iptables 已放行 TCP $START_PORT~$end_port" || \
+                log_warn "iptables 操作失败，请手动放行"
+            save_iptables
+        fi
     else
         log_warn "未检测到防火墙工具，请手动在安全组放行 TCP $START_PORT~$end_port"
     fi
 }
 
-# ── 保存信息 ──────────────────────────────────────────────
+# ── 保存信息（v5.2：重复运行时仅更新 IP 和时间戳）─────────
 save_info() {
     local end_port=$(( START_PORT + MAX_NODES - 1 ))
+
+    # v5.2：统计已对接节点数
+    local node_count=0
+    if [[ -f "$RELAY_CONFIG" ]]; then
+        node_count=$(python3 -c "
+import json
+try:
+    c = json.load(open('$RELAY_CONFIG'))
+    print(len(c.get('inbounds', [])))
+except: print(0)" 2>/dev/null || echo 0)
+    fi
+
     cat > "$INFO_FILE" << EOF
 ============================================================
   中转机信息  $(date '+%Y-%m-%d %H:%M:%S')
+  已对接落地机: ${node_count} 台
 ============================================================
 ZHONGZHUAN_IP=${PUBLIC_IP}
 ZHONGZHUAN_PRIVKEY=${RELAY_PRIVKEY}
@@ -397,8 +486,10 @@ ZHONGZHUAN_XRAY_BIN=${XRAY_BIN}
 
 ── 端口规划 ──────────────────────────────────────────────
 预留端口: ${START_PORT} ~ ${end_port}（共 ${MAX_NODES} 个）
+已使用 : ${node_count} 个
 
 ── 管理命令 ──────────────────────────────────────────────
+查看当前状态    : bash zhongzhuan.sh --status
 查看已对接节点  : python3 -m json.tool ${RELAY_NODES}
 查看中转配置    : python3 -m json.tool ${RELAY_CONFIG}
 重启 xray-relay : systemctl restart xray-relay
@@ -412,30 +503,67 @@ EOF
 # ── 打印结果 ──────────────────────────────────────────────
 print_result() {
     local end_port=$(( START_PORT + MAX_NODES - 1 ))
+
+    # 统计已对接节点
+    local node_count=0
+    if [[ -f "$RELAY_CONFIG" ]]; then
+        node_count=$(python3 -c "
+import json
+try:
+    c = json.load(open('$RELAY_CONFIG'))
+    print(len(c.get('inbounds', [])))
+except: print(0)" 2>/dev/null || echo 0)
+    fi
+
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 中转机初始化完成  zhongzhuan.sh v5.1${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}║  ${GREEN}${BOLD}✓ 中转机初始化完成  zhongzhuan.sh v5.2${NC}              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${BOLD}中转机 IP     :${NC} $PUBLIC_IP"
     echo -e "  ${BOLD}公钥 (pubkey) :${NC} $RELAY_PUBKEY"
     echo -e "  ${BOLD}SNI           :${NC} $RELAY_SNI"
     echo -e "  ${BOLD}Short ID      :${NC} $RELAY_SHORT_ID"
-    echo -e "  ${BOLD}端口范围      :${NC} $START_PORT ~ $end_port"
+    echo -e "  ${BOLD}端口范围      :${NC} $START_PORT ~ $end_port（共 $MAX_NODES 个）"
+    echo -e "  ${BOLD}已对接节点    :${NC} $node_count 台"
     echo -e "  ${BOLD}xray-relay    :${NC} $(systemctl is-active xray-relay 2>/dev/null)"
     echo ""
+    if [[ $node_count -gt 0 ]]; then
+        echo -e "${YELLOW}已对接节点列表：${NC}"
+        python3 - "$RELAY_NODES" << 'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    for i, n in enumerate(data.get("nodes", []), 1):
+        port = n.get("relay_port", n.get("port", "?"))
+        ip   = n.get("luodi_ip", "?")
+        lbl  = n.get("label", "")
+        lid  = n.get("link_id", "?")
+        print(f"  [{i}] 中转端口={port}  落地IP={ip}  {lbl}  (LINK_ID={lid})")
+except Exception:
+    pass
+PYEOF
+        echo ""
+    fi
     echo -e "${YELLOW}下一步：在每台落地机上运行 luodi.sh → duijie.sh${NC}"
+    echo -e "${YELLOW}查看状态：bash zhongzhuan.sh --status${NC}"
     echo ""
 }
 
 main() {
+    # v5.2：--status 快速查看
+    if [[ "${1:-}" == "--status" ]]; then
+        cmd_status
+        exit 0
+    fi
+
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       中转机初始化脚本  zhongzhuan.sh  v5.1         ║${NC}"
+    echo -e "${CYAN}║       中转机初始化脚本  zhongzhuan.sh  v5.2         ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     find_or_install_xray
-    load_or_generate_relay_keys   # BUG-3 修复：保留已有密钥
+    load_or_generate_relay_keys
     choose_relay_sni
     get_public_ip
     get_user_config
